@@ -1,0 +1,36 @@
+{
+  "shortcuts": {
+    "browser": {
+      "up": "client.browser.up",
+      "k": "client.browser.up",
+      "down": "client.browser.down",
+      "j": "client.browser.down",
+      "left": "client.browser.left",
+      "h": "client.browser.left",
+      "right": "client.browser.right",
+      "l": "client.browser.right",
+      "enter": "client.browser.choose",
+      "esc": "client.browser.exit",
+      "q": "client.browser.exit",
+      "ctrl+c": "client.browser.exit",
+      "c": "client.create",
+      "x": "client.close",
+      "r": "client.rename",
+      "ctrl+r": "session.refresh",
+      "?": "client.shortcuts"
+    },
+    "terminal": {
+      "ctrl+b>ctrl+shift+'": "pane.split.down",
+      "ctrl+b>ctrl+shift+5": "pane.split.right",
+      "ctrl+b>\"": "pane.split.down",
+      "ctrl+b>%": "pane.split.right",
+      "ctrl+b>o": "pane.focus_next",
+      "ctrl+b>c": "client.tab.new",
+      "ctrl+b>n": "client.tab.next",
+      "ctrl+b>p": "client.tab.previous",
+      "ctrl+b>d": "client.detach",
+      "ctrl+b>ctrl+b": "client.send_prefix",
+      "ctrl+b>?": "client.shortcuts"
+    }
+  }
+}
