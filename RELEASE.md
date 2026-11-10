@@ -10,8 +10,10 @@ nix develop .#release --command cargo build --release --locked
 
 On macOS, the release shell uses Apple's linker and SDK from the active Xcode
 installation (selected with `xcode-select`). This keeps the release binary's
-runtime libraries independent of the Nix store. CI prints and checks the linked
-libraries with `otool -L` before packaging.
+runtime libraries independent of the Nix store. The release toolchain disables
+rust-overlay's propagated Nix `libiconv` dependency and searches the Apple SDK's
+libraries explicitly, so Rust's standard library links against system `libiconv`.
+CI prints and checks the linked libraries with `otool -L` before packaging.
 
 The binary is written to `target/<target>/release/rex-attach`. From a clean,
 committed working tree, use the release script:

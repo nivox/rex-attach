@@ -40,9 +40,13 @@
             "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-unknown-linux-musl"
           else
             pkgs.stdenv.hostPlatform.rust.rustcTarget;
-          releaseRust = pkgs.rust-bin.stable."1.96.0".minimal.override {
+          releaseRust = (pkgs.rust-bin.stable."1.96.0".minimal.override {
             targets = [ releaseTarget ];
-          };
+          }).overrideAttrs (_: pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+            # rust-overlay propagates Nix libiconv for Darwin's Rust std.
+            # Portable releases resolve iconv from the host Apple SDK instead.
+            depsTargetTargetPropagated = [ ];
+          });
         in
         {
           default = pkgs.mkShell {
@@ -74,6 +78,7 @@
             shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
               export SDKROOT="$(/usr/bin/env -u SDKROOT /usr/bin/xcrun --sdk macosx --show-sdk-path)"
               export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang
+              export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="-L native=$SDKROOT/usr/lib"
               export CC_aarch64_apple_darwin=/usr/bin/clang
               export CXX_aarch64_apple_darwin=/usr/bin/clang++
               export AR_aarch64_apple_darwin=/usr/bin/ar
