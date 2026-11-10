@@ -65,6 +65,9 @@ jobs:
               echo "Tag $GITHUB_REF_NAME does not match Cargo version v$version" >&2
               exit 1
             fi
+            if [[ "$RUNNER_OS" == macOS ]]; then
+              bash scripts/check-macos-release-toolchain.sh
+            fi
             cargo build --release --locked
           '
       - name: Smoke test and package binary
