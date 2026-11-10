@@ -277,7 +277,55 @@ monospace font, with glyph fallback. It bounds capture to 240×120 cells, render
 fallback lookup, resizing and encoding run on blocking workers behind one shared
 semaphore permit. A cancelled job retains that permit until it finishes, so rapid
 selection changes cannot accumulate image jobs. This is software rendering with
-no display server/GPU; complex emoji shaping and embedded images are unavailable.
+no display server/GPU; complex emoji shaping is unavailable.
+
+## Embedded terminal graphics
+
+Static Kitty images are retained from the initial snapshot and live stream. The
+native decoder budget is set before restoration (64 MiB per screen). PNG decoding
+uses allocation limits before parsing, converts supported PNG colors to RGBA, and
+returns memory through Ghostty's allocator. File, temporary-file and shared-memory
+loading remain disabled in the client. The tested Rex server normalizes file
+transmissions into inline pixels for its viewers; other servers must do likewise.
+
+The two text backends extract image geometry from their own render snapshot,
+before cleaning it. A second render-state update would consume dirty rows and
+hide text updates. The resolved native iterator handles ordinary, Unicode and
+relative placements. At most 1,024 placements and 64 MiB of owned RGBA pixels are
+captured per view. Pixel copies are shared and cached by image ID and generation;
+geometry and preview equality also track image-only changes. Placeholder glyphs
+are suppressed in text output. The preview rasterizer composites images around
+backgrounds, text and cursor, respecting source crops, offsets and clipping.
+
+Attached graphics are independent of preview fonts and enabled by `--images`
+(`auto`, `kitty`, `off`). One startup probe supplies both paths and keeps the
+existing single TTY input reader. Native attachment placement is disabled under
+tmux; the existing Unicode-based browser preview path still supports passthrough.
+Unsupported terminals keep text output. `--images kitty` uses 10x20 cells when
+probing fails. Interactive resize includes detected cell pixel sizes when known;
+stream resize metadata preserves server pixel metrics. Previews never resize Rex.
+
+A shared output layer maps resolved placements to client-owned Kitty IDs for both
+renderers. Cropping, resampling, background masks and base64 preparation run on a
+blocking worker behind the same single-permit semaphore as previews. Prepared
+pixels are capped at 64 MiB per frame. A cancelled worker retains its permit;
+obsolete results are discarded. Geometry-only moves reuse uploaded pixel variants.
+Uploads are chunked at 4 KiB of base64 and drained at up to 256 KiB per frame plus
+small control sequences, while input and RPC ordering remain unchanged. Pending
+image work keeps the streaming RPC helper drawing even without more remote output.
+No local input/query callbacks are installed; Rex alone answers the program. Old
+placements remain visible until replacement uploads finish. All output uses quiet
+Kitty commands, and text cursor/style state is preserved around placement output.
+
+Source z-order is mapped to native under-text/above-text order. Below-background
+images mask non-default cell backgrounds before transmission because the text
+renderers use explicit RGB backgrounds. Deletion and help/navigation/exit cleanup
+address only allocated client image IDs, including interrupted uploads. Returning
+from help creates a fresh renderer and reuploads the current image state.
+
+Animation frame scheduling, Sixel/iTerm2 input, and native attachment graphics
+through multiplexers remain unimplemented. The decoder retains static frames;
+animation would additionally require the native animation clock and redraw deadlines.
 
 ## Configuration and build decisions
 
@@ -292,13 +340,63 @@ overrides it. [config.example.json](config.example.json) records the default map
 The repository builds independently of sibling checkouts. Rust 1.96+ and Zig
 0.17.x are required for the default native build; `flake.nix` supplies the Rust/C
 and Zig toolchains, pkg-config, Python and DejaVu Sans Mono for previews/tests.
-Published `ghostty-vt` and `ghostty-vt-sys` 0.8.0 dependencies are pinned in
-Cargo.lock. The native binding downloads checksum-verified Ghostty sources;
-offline builds need those sources and Zig dependencies or a compatible static
-library through pkg-config. No Ghostty source or fonts are vendored. The complete
-snapshot decoder suffices because restoration buffers through FINISH; local
-incremental-decoder or graphics patches are unnecessary. Dependency provenance
-and adapted-code attribution live in [THIRD_PARTY.md](THIRD_PARTY.md).
+The pinned `ghostty-vt` and `ghostty-vt-sys` 0.8.0 dependencies come from crates.io.
+The native binding downloads checksum-verified Ghostty sources; offline builds
+need those sources and Zig dependencies or a compatible static library through
+pkg-config. No Ghostty wrapper, native source, or fonts are vendored.
+
+### Native adapter and upstream replacement
+
+`vt.rs` and `vt/` provide an original adapter over the published
+`ghostty-vt-sys` C bindings. The native libghostty-vt API already supports the
+operations we need, but the pinned higher-level `ghostty-vt` Rust crate does not
+expose all of them. Its terminal and render handles are private, so extending it
+locally would otherwise require a fork or assumptions about private Rust layouts.
+The adapter owns terminal/render/snapshot handles and provides lifetime-bound
+row/cell cursors and bulk image geometry queries. Native
+handles remain on their creating thread. No query/input callbacks are installed:
+Rex answers programs, and local emulation cannot accumulate or replay replies.
+The complete native snapshot decoder validates the independently framed snapshot
+and applies the image budget before restoring pixels. Public Rust types and the
+PNG callback hook still come from the registry crate. Dependency provenance is
+recorded in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+The gaps that require this adapter are:
+
+| Surface | Required behavior missing or incorrectly represented in the pinned Rust wrapper |
+| --- | --- |
+| Resolved render images | Iterate ordinary, Unicode-placeholder and relative placements from the same render update as text, including crop, viewport coordinates, pixel offsets, dimensions, layer, z-order and image generation. Storage placement enumeration alone cannot supply equivalent resolved geometry. |
+| Snapshot restoration | Set image-storage and continuation limits before decoding; restore the complete snapshot transactionally, including image records and parser continuation, and verify completion and the consumed byte boundary. |
+| Graphics media controls | Disable file, temporary-file and shared-memory input with the correct native types. In particular, the temporary-file setting is an optional directory string, which the pinned wrapper models as a boolean. |
+
+Replace the adapter with built-in support in the libghostty-vt Rust crate
+(currently packaged as `ghostty-vt`) when a published version satisfies these
+conditions:
+
+- Its public APIs cover the gaps above and the terminal, history, mode, resize,
+  row/cell and image access used by this client. Ownership and borrowing must
+  prevent cursors or image slices from surviving invalidating mutations, and
+  handles must retain the native threading constraints. A supported public
+  native-handle API can justify a smaller extension while complete wrappers land.
+- It preserves one render update for both text and images, dirty-row rendering,
+  cell widths, image-generation cache invalidation and bounded image work.
+  Snapshot limits apply before allocation, local media remain disabled, and
+  query handling can leave Rex as the sole responder without accumulating replies.
+- Its native ABI and snapshot format remain compatible with the supported Rex
+  protocol revisions. The pinned registry dependency builds independently of
+  sibling checkouts, without vendoring or copied source/assets, through the
+  supported Zig build or compatible pkg-config library.
+- The migration passes the Nix checks below, emulator comparisons and explicit-font
+  raster tests. When a local server is available, run disposable graphics,
+  mouse, ownership, navigation and preview smoke scenarios with both renderers.
+  Compare serial release benchmarks against the adapter for sparse/heavy text,
+  static images and image replacement; review median/p95 time, CPU and output
+  bytes, and investigate regressions before removing the corresponding adapter.
+
+Reevaluate these conditions when upgrading the crate. Remove adapter pieces as
+their upstream replacements pass the same checks, and remove `vt/` entirely once
+all required surfaces are covered. Unused features such as animation are not a
+prerequisite for replacing the current static-image implementation.
 
 ## Validation
 
@@ -319,6 +417,21 @@ shortcut/paste handling, status ordering and propagation, renderer comparisons
 against another emulator, Kitty transfers/deletion and bounded worker work.
 The explicit-font raster test uses the shell's font or `REX_ATTACH_PREVIEW_FONT`.
 Renderer release benchmarks are separate from normal tests.
+Run these commands separately in the Nix shell, without concurrent benchmarks:
+
+```sh
+REX_BENCH_BACKEND=legacy REX_BENCH_IMAGES=1 cargo test --release --locked renderer_comparison -- --ignored --nocapture --test-threads=1
+REX_BENCH_BACKEND=ratatui REX_BENCH_IMAGES=1 cargo test --release --locked renderer_comparison -- --ignored --nocapture --test-threads=1
+cargo test --release --locked graphics_comparison -- --ignored --nocapture --test-threads=1
+```
+
+For a text-only baseline, run the first two commands against an exported baseline
+checkout without `REX_BENCH_IMAGES`. Compare the same workloads and toolchains,
+repeat runs and alternate backend order. The graphics workload measures text
+updates beside an unchanged image and image replacement, including worker
+preparation and output generation. Output is collected in memory, so it excludes
+real terminal upload and rendering costs. Keep dated measurements as local
+artifacts and summarize relevant comparisons in the commit or PR description.
 
 For ownership, protocol ordering, navigation or graphics changes, run relevant
 smoke scenarios when a local Rex server and CLI are available. Scripts create and
@@ -331,6 +444,7 @@ python3 scripts/live-smoke.py --socket /path/to/rex.sock --mode session --multi-
 python3 scripts/ownership-smoke.py --socket /path/to/rex.sock
 python3 scripts/shortcuts-smoke.py --socket /path/to/rex.sock
 python3 scripts/mouse-smoke.py --socket /path/to/rex.sock
+python3 scripts/graphics-smoke.py --socket /path/to/rex.sock --probe-file-media
 python3 scripts/activity-smoke.py --socket /path/to/rex.sock
 ```
 
@@ -342,14 +456,16 @@ an explicit font and `--image-out /tmp/preview.png` saves decoded pixels. Owners
 smoke exercises simultaneous clients and resize/release; shortcut smoke covers
 management, navigation, config overrides and modal help; mouse smoke covers both
 renderers, browser activation, SGR/legacy/fragmented reports, held-button cleanup,
-help isolation, local history, resize and exit cleanup; activity smoke covers
+help isolation, local history, resize and exit cleanup; graphics smoke verifies
+embedded previews, snapshot/live pixels, compression, file-media normalization,
+scrolling and graphics lifecycle on both renderers; activity smoke covers
 metadata, status changes/clearing and parent aggregation. These checks provide
 bounded evidence, not a guarantee of arbitrary terminal compatibility.
 
 ## Unimplemented capabilities
 
 Automatic reconnect/data resume, semantic keyboard/paste events, focus
-forwarding, scrollback search, embedded terminal graphics and clipboard
+forwarding, scrollback search, animated images, non-Kitty image protocols and clipboard
 integration remain outside the implementation. There is no guarantee of color
 fallback or translation between differing keyboard protocols. Live theme and
 process-exit metadata presentation are also unimplemented.

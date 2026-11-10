@@ -57,6 +57,30 @@ pub fn size() -> io::Result<(u16, u16)> {
     let size = unsafe { size.assume_init() };
     Ok((size.ws_col.max(1), size.ws_row.max(1)))
 }
+
+static CELL_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+static CELL_HEIGHT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+pub fn set_cell_pixels(width: u16, height: u16) {
+    CELL_WIDTH.store(width, std::sync::atomic::Ordering::Relaxed);
+    CELL_HEIGHT.store(height, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn cell_pixels() -> Option<(u16, u16)> {
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    // SAFETY: ioctl initializes winsize when it succeeds.
+    if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, size.as_mut_ptr()) } >= 0 {
+        let size = unsafe { size.assume_init() };
+        if size.ws_col > 0
+            && size.ws_row > 0
+            && size.ws_xpixel >= size.ws_col
+            && size.ws_ypixel >= size.ws_row
+        {
+            return Some((size.ws_xpixel / size.ws_col, size.ws_ypixel / size.ws_row));
+        }
+    }
+    let width = CELL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+    let height = CELL_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    (width > 0 && height > 0).then_some((width, height))
+}
 pub struct Guard {
     termios: libc::termios,
 }
@@ -103,8 +127,8 @@ impl MouseGuard {
     pub fn set(&mut self, motion: bool) -> io::Result<()> {
         self.set_mode(if motion { 1003 } else { 1000 })
     }
-    pub fn track(&mut self, terminal: &ghostty_vt::Terminal) -> anyhow::Result<()> {
-        use ghostty_vt::terminal::Mode;
+    pub fn track(&mut self, terminal: &crate::vt::Terminal) -> anyhow::Result<()> {
+        use crate::vt::terminal::Mode;
         self.set_mode(if terminal.mode(Mode::ANY_MOUSE)? {
             1003
         } else if terminal.mode(Mode::BUTTON_MOUSE)? {
@@ -114,7 +138,7 @@ impl MouseGuard {
         })?;
         Ok(())
     }
-    pub fn resume(&mut self, terminal: &ghostty_vt::Terminal) -> anyhow::Result<()> {
+    pub fn resume(&mut self, terminal: &crate::vt::Terminal) -> anyhow::Result<()> {
         self.0 = None;
         self.track(terminal)
     }

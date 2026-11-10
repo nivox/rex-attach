@@ -58,7 +58,9 @@ def main():
                 clients.append(client)
                 return client
             first = spawn(80, 24, ['--take'])  # compatibility flag still accepted
-            wait(lambda:dimensions()==(80,24) and owner() is not None, 'first client sizes terminal')
+            # The new session can already have this default size and an owner.
+            # Wait for this client to finish capability probing and draw first.
+            wait(lambda:b'\x1b[?2026h' in first['output'] and dimensions()==(80,24) and owner() is not None, 'first client sizes terminal')
             first_owner = owner()
             # Read-only captures must not take ownership or change the size.
             subprocess.run(command+['--capture'], env=env, check=True, stdout=subprocess.DEVNULL, timeout=15)

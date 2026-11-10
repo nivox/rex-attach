@@ -78,8 +78,18 @@ terminal history; typing returns to the live viewport. Alternate-screen programs
 receive arrow-key scrolling only when they enable alternate-scroll mode. Use your
 outer terminal's mouse-selection override (commonly Shift) for text selection.
 
-This is an early client: scrollback search, embedded terminal images,
-and automatic reconnect are unavailable. Keyboard protocols are forwarded rather
+Static Kitty images appear in attached terminals and browser image previews.
+Attached images use native Kitty placements in a directly connected terminal;
+`--images auto` detects support, `--images kitty` forces it, and `--images off`
+keeps text only. Attached images are disabled under tmux; browser image previews
+retain their existing tmux support. PNG, RGB/RGBA, compressed/chunked uploads,
+cropping, layers, Unicode placeholders, and relative placements are supported.
+Rex must send inline pixels for live file/shared-memory images; rex-attach never
+opens the server's image paths. The graphics smoke test verifies file-image
+normalization on the local Rex server.
+
+This is an early client: animation playback, Sixel/iTerm2 images, scrollback
+search, and automatic reconnect are unavailable. Keyboard protocols are forwarded rather
 than translated. Interactive mode requires a terminal (`TERM=dumb` is unsupported).
 Run `rex-attach --help` for all options.
 

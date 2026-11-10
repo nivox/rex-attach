@@ -26,6 +26,9 @@ struct Args {
     /// Attached terminal renderer.
     #[arg(long, value_enum, default_value = "ansi")]
     renderer: terminal::Backend,
+    /// Embedded terminal images: detect Kitty support, force Kitty, or disable.
+    #[arg(long, value_enum, default_value = "auto")]
+    images: crate::graphics::output::Mode,
     /// Compatibility flag: interactive attachment always takes ownership.
     #[arg(long = "take", hide = true, conflicts_with = "capture")]
     _take: bool,
@@ -44,6 +47,7 @@ struct Config {
     args: Args,
     socket: String,
     shortcuts: shortcuts::Config,
+    graphics: Option<[u32; 2]>,
 }
 impl std::ops::Deref for Config {
     type Target = Args;
@@ -53,6 +57,7 @@ impl std::ops::Deref for Config {
 }
 
 pub async fn run() -> Result<()> {
+    crate::graphics::install_decoder()?;
     let args = Args::parse();
     let shortcuts = shortcuts::Config::load()?;
     if !args.capture {
@@ -66,10 +71,11 @@ pub async fn run() -> Result<()> {
         );
     }
     let (socket, mut control) = crate::discovery::connect(args.socket.as_deref()).await?;
-    let args = Config {
+    let mut args = Config {
         args,
         socket,
         shortcuts,
+        graphics: None,
     };
     let scope = if let Some(session) = &args.session {
         Some(control.resolve_session(session).await?)
@@ -91,8 +97,28 @@ pub async fn run() -> Result<()> {
     }
     let _guard = tty::Guard::enter().context("entering terminal mode")?;
     let mut input = tty::Input::open().context("opening terminal input")?;
+    let detected = if matches!(args.images, crate::graphics::output::Mode::Off)
+        && matches!(args.preview, preview::Mode::Text)
+    {
+        None
+    } else {
+        preview::probe(&mut input).await?
+    };
+    if let Some(g) = &detected {
+        tty::set_cell_pixels(g.font.width, g.font.height);
+    }
+    args.graphics = match args.images {
+        crate::graphics::output::Mode::Off => None,
+        _ if std::env::var_os("TMUX").is_some() => None,
+        crate::graphics::output::Mode::Auto => detected
+            .as_ref()
+            .map(|g| [u32::from(g.font.width), u32::from(g.font.height)]),
+        crate::graphics::output::Mode::Kitty => Some(detected.as_ref().map_or([10, 20], |g| {
+            [u32::from(g.font.width), u32::from(g.font.height)]
+        })),
+    };
     let options =
-        preview::Options::detect(args.preview, args.preview_font.as_deref(), &mut input).await?;
+        preview::Options::detect(args.preview, args.preview_font.as_deref(), detected).await?;
     let mut notice = String::new();
     let mut previous = None;
     let mut browser = browser::Browser::new(
@@ -203,8 +229,7 @@ async fn attach_inner(
         &mut data,
         &mut state,
         input.context("missing interactive input")?,
-        &args.shortcuts,
-        args.renderer,
+        args,
     )
     .await
 }
@@ -215,14 +240,14 @@ async fn interactive(
     data: &mut protocol::Socket,
     state: &mut terminal::State,
     input_tty: &mut tty::Input,
-    config: &shortcuts::Config,
-    backend: terminal::Backend,
+    config: &Config,
 ) -> Result<Flow> {
-    let bindings = &config.terminal;
+    let bindings = &config.shortcuts.terminal;
+    let backend = config.renderer;
     let mut mouse = tty::MouseGuard::enter(false)?;
     let mut tick = tokio::time::interval(Duration::from_millis(16));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut renderer = terminal::Renderer::new(backend)?;
+    let mut renderer = terminal::Renderer::new(backend)?.with_graphics(config.graphics)?;
     let mut winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -253,7 +278,7 @@ async fn interactive(
                 let events=keys.timeout();
                 Some(events)
             }
-            _ = tick.tick(), if dirty => {
+            _ = tick.tick(), if dirty || renderer.images_pending() => {
                 if state.render_held(std::time::Instant::now())? { continue; }
                 draw_terminal(&mut renderer, state, dimensions)?;
                 dirty = false;
@@ -274,12 +299,21 @@ async fn interactive(
                 match action {
                     TerminalAction::Navigate(flow) => return Ok(flow),
                     TerminalAction::Help => {
-                        if !help::show_terminal(config, input_tty, data, state, control, target)
-                            .await?
+                        renderer.clear_images()?;
+                        if !help::show_terminal(
+                            &config.shortcuts,
+                            input_tty,
+                            data,
+                            state,
+                            control,
+                            target,
+                        )
+                        .await?
                         {
                             return Ok(Flow::Exit);
                         }
-                        renderer = terminal::Renderer::new(backend)?;
+                        renderer =
+                            terminal::Renderer::new(backend)?.with_graphics(config.graphics)?;
                         mouse.resume(state.terminal()?)?;
                         dimensions = tty::size()?;
                         dirty = true;
@@ -301,7 +335,7 @@ fn draw_terminal(
     renderer: &mut terminal::Renderer,
     state: &mut terminal::State,
     size: (u16, u16),
-) -> Result<()> {
+) -> Result<bool> {
     let frame = renderer.frame(state.terminal()?, size.0, size.1)?;
     if !frame.is_empty() {
         let mut out = io::stdout().lock();
@@ -309,7 +343,7 @@ fn draw_terminal(
             .context("drawing terminal screen")?;
         out.flush().context("flushing terminal screen")?;
     }
-    Ok(())
+    Ok(renderer.images_pending())
 }
 
 enum TerminalAction {
@@ -536,6 +570,7 @@ mod attach_tests {
                     args: cli,
                     socket: "/unused".into(),
                     shortcuts: shortcuts::Config::load()?,
+                    graphics: None,
                 };
                 let target = Target {
                     session: "session:test".into(),

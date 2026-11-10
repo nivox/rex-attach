@@ -14,7 +14,7 @@ pub struct Renderer {
     cells: CellIterator,
     buffers: Buffers,
     dimensions: Option<(u16, u16, u16, u16)>,
-    colors: Option<(ghostty_vt::style::RgbColor, ghostty_vt::style::RgbColor)>,
+    colors: Option<(crate::vt::style::RgbColor, crate::vt::style::RgbColor)>,
     cursor: Option<Option<(u16, u16)>>,
     text: String,
 }
@@ -36,12 +36,26 @@ impl Renderer {
         })
     }
 
+    #[cfg(test)]
     pub fn frame(&mut self, terminal: &Terminal, width: u16, height: u16) -> Result<String> {
-        use ghostty_vt::render::Dirty;
+        Ok(self.frame_images(terminal, width, height, None)?.0)
+    }
+    pub(super) fn frame_images(
+        &mut self,
+        terminal: &Terminal,
+        width: u16,
+        height: u16,
+        images: Option<&mut crate::graphics::Images>,
+    ) -> Result<(String, Vec<crate::graphics::Image>)> {
+        use crate::vt::render::Dirty;
         let snapshot = self.state.update(terminal)?;
+        let images = images
+            .map(|cache| cache.capture(terminal, &snapshot))
+            .transpose()?
+            .unwrap_or_default();
         let dimensions = (width, height, snapshot.cols()?, snapshot.rows()?);
         let defaults = snapshot.colors()?;
-        let rgb = |c: ghostty_vt::style::RgbColor| Color::Rgb(c.r, c.g, c.b);
+        let rgb = |c: crate::vt::style::RgbColor| Color::Rgb(c.r, c.g, c.b);
         let colors = (defaults.foreground, defaults.background);
         let reset = self.dimensions != Some(dimensions) || self.colors != Some(colors);
         let all = reset || snapshot.dirty()? == Dirty::Full;
@@ -106,19 +120,19 @@ impl Renderer {
         self.dimensions = Some(dimensions);
         self.colors = Some(colors);
         self.cursor = Some(cursor);
-        Ok(String::from_utf8(output)?)
+        Ok((String::from_utf8(output)?, images))
     }
 }
 
 fn paint_cell(
-    cell: &ghostty_vt::render::CellIteration<'_>,
+    cell: &crate::vt::render::CellIteration<'_>,
     target: &mut Cell,
     text: &mut String,
-    defaults: &ghostty_vt::render::Colors,
+    defaults: &crate::vt::render::Colors,
     visible_width: u16,
 ) -> Result<()> {
-    use ghostty_vt::screen::CellWide;
-    let rgb = |c: ghostty_vt::style::RgbColor| Color::Rgb(c.r, c.g, c.b);
+    use crate::vt::screen::CellWide;
+    let rgb = |c: crate::vt::style::RgbColor| Color::Rgb(c.r, c.g, c.b);
     let wide = cell.raw_cell()?.wide()?;
     let style = cell.style()?;
     let mut fg = cell.fg_color()?.unwrap_or(defaults.foreground);
@@ -140,6 +154,9 @@ fn paint_cell(
         cell.graphemes_utf8(text)?;
     }
     text.retain(|c| !c.is_control());
+    if text.starts_with("\u{10eeee}") {
+        text.clear();
+    }
     if wide == CellWide::SpacerTail
         || wide == CellWide::SpacerHead
         || (wide == CellWide::Wide && visible_width < 2)

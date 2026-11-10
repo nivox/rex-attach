@@ -1,12 +1,12 @@
 //! Rasterize the mirrored terminal grid, without a GUI or a remote resize.
-use anyhow::{Context, Result, ensure};
-use fontdue::{Font, FontSettings, Metrics};
-use ghostty_vt::{
+use crate::vt::{
     RenderState, Terminal,
     render::{CellIterator, RowIterator},
     screen::CellWide,
     style::{RgbColor, Underline},
 };
+use anyhow::{Context, Result, ensure};
+use fontdue::{Font, FontSettings, Metrics};
 use image::{DynamicImage, Rgba, RgbaImage};
 use std::{collections::HashMap, path::Path};
 
@@ -29,12 +29,15 @@ pub struct Grid {
     cells: Vec<Cell>,
     cursor: Option<(u16, u16)>,
     cursor_color: [u8; 3],
+    background: [u8; 3],
+    images: Vec<crate::graphics::Image>,
+    cell_pixels: [u32; 2],
 }
 fn rgb(c: RgbColor) -> [u8; 3] {
     [c.r, c.g, c.b]
 }
 impl Grid {
-    pub fn capture(terminal: &Terminal) -> Result<Self> {
+    pub fn capture(terminal: &Terminal, images: &mut crate::graphics::Images) -> Result<Self> {
         let mut state = RenderState::new()?;
         let snapshot = state.update(terminal)?;
         // Bound pathological terminal sizes before allocating pixels or cells.
@@ -48,6 +51,9 @@ impl Grid {
             cells: Vec::with_capacity(usize::from(cols) * usize::from(rows)),
             cursor: None,
             cursor_color: rgb(snapshot.cursor_color()?.unwrap_or(colors.foreground)),
+            background: rgb(colors.background),
+            images: images.capture(terminal, &snapshot)?,
+            cell_pixels: crate::graphics::cell_pixels(terminal)?,
         };
         if snapshot.cursor_visible()? {
             grid.cursor = snapshot.cursor_viewport()?.map(|p| (p.x, p.y));
@@ -191,10 +197,26 @@ impl Rasterizer {
         })
     }
     pub fn render(&mut self, grid: &Grid) -> DynamicImage {
-        let mut image = RgbaImage::new(u32::from(grid.cols) * CW, u32::from(grid.rows) * CH);
-        for (index, cell) in grid.cells.iter().enumerate() {
+        let mut image = RgbaImage::from_pixel(
+            u32::from(grid.cols) * CW,
+            u32::from(grid.rows) * CH,
+            Rgba([
+                grid.background[0],
+                grid.background[1],
+                grid.background[2],
+                255,
+            ]),
+        );
+        grid.paint_images(&mut image, 0);
+        for (index, cell) in grid
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.bg != grid.background)
+        {
             Canvas::new(&mut image, cell, index, grid.cols, self.baseline).background();
         }
+        grid.paint_images(&mut image, 1);
         for (index, cell) in grid.cells.iter().enumerate().filter(|(_, c)| !c.tail) {
             let mut canvas = Canvas::new(&mut image, cell, index, grid.cols, self.baseline);
             for ch in cell
@@ -206,6 +228,7 @@ impl Rasterizer {
             }
             canvas.decorations();
         }
+        grid.paint_images(&mut image, 2);
         grid.draw_cursor(&mut image);
         DynamicImage::ImageRgba8(image)
     }
@@ -306,6 +329,32 @@ impl<'a> Canvas<'a> {
     }
 }
 impl Grid {
+    fn paint_images(&self, canvas: &mut RgbaImage, layer: i32) {
+        use image::Pixel;
+        let mut budget = crate::graphics::IMAGE_LIMIT / 4;
+        for image in self.images.iter().filter(|i| i.placement.layer == layer) {
+            let at = crate::graphics::bounds(
+                image,
+                self.cell_pixels,
+                [CW, CH],
+                [canvas.width(), canvas.height()],
+            );
+            let area = u64::from(at[2] - at[0]) * u64::from(at[3] - at[1]);
+            if area > budget {
+                continue;
+            }
+            budget -= area;
+            for y in at[1]..at[3] {
+                for x in at[0]..at[2] {
+                    if let Some(pixel) =
+                        crate::graphics::sample(image, self.cell_pixels, [CW, CH], x, y)
+                    {
+                        canvas.get_pixel_mut(x, y).blend(&pixel);
+                    }
+                }
+            }
+        }
+    }
     fn draw_cursor(&self, image: &mut RgbaImage) {
         let Some((cx, cy)) = self
             .cursor
@@ -326,8 +375,8 @@ impl Grid {
 }
 
 fn capture_cell(
-    cell: &ghostty_vt::render::CellIteration<'_>,
-    colors: &ghostty_vt::render::Colors,
+    cell: &crate::vt::render::CellIteration<'_>,
+    colors: &crate::vt::render::Colors,
 ) -> Result<Cell> {
     let style = cell.style()?;
     let wide = cell.raw_cell()?.wide()?;
@@ -345,6 +394,9 @@ fn capture_cell(
     if !style.invisible && wide != CellWide::SpacerTail && wide != CellWide::SpacerHead {
         cell.graphemes_utf8(&mut text)?;
     }
+    if text.starts_with("\u{10eeee}") {
+        text.clear();
+    }
     Ok(Cell {
         text,
         fg,
@@ -361,7 +413,44 @@ fn capture_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghostty_vt::TerminalOptions;
+    use crate::vt::TerminalOptions;
+
+    #[test]
+    #[ignore = "requires REX_ATTACH_PREVIEW_FONT or an installed monospace font"]
+    fn rasterized_preview_composites_embedded_images_in_text_background_order() -> Result<()> {
+        let mut terminal = crate::graphics::tests::terminal()?;
+        terminal.vt_write(b"\x1b[?25l");
+        crate::graphics::tests::transmit(
+            &mut terminal,
+            42,
+            [255, 0, 0, 255],
+            "c=2,r=2,z=-2000000000",
+        );
+        terminal.vt_write(b"\x1b[1;1H\x1b[48;2;0;255;0m \x1b[0m");
+        let mut images = crate::graphics::Images::new()?;
+        let grid = Grid::capture(&terminal, &mut images)?;
+        let mut raster = Rasterizer::load(
+            std::env::var_os("REX_ATTACH_PREVIEW_FONT")
+                .as_deref()
+                .map(Path::new),
+        )?;
+        let picture = raster.render(&grid).into_rgba8();
+        assert_eq!(picture.get_pixel(0, 0).0, [0, 255, 0, 255]);
+        assert_eq!(picture.get_pixel(CW, 0).0, [255, 0, 0, 255]);
+        terminal.vt_write(b"\x1b[H");
+        crate::graphics::tests::transmit(&mut terminal, 43, [0, 0, 255, 255], "c=1,r=1,z=1");
+        let changed = Grid::capture(&terminal, &mut images)?;
+        assert_ne!(
+            grid, changed,
+            "image-only changes must invalidate preview deduplication"
+        );
+        assert_eq!(
+            raster.render(&changed).into_rgba8().get_pixel(0, 0).0,
+            [0, 0, 255, 255]
+        );
+        Ok(())
+    }
+
     #[test]
     fn grid_captures_full_viewport_styles_unicode_and_cursor() -> Result<()> {
         let mut terminal = Terminal::new(TerminalOptions {
@@ -370,7 +459,7 @@ mod tests {
             ..Default::default()
         })?;
         terminal.vt_write("\x1b[1;3;4;38;2;10;20;30;48;2;40;50;60mA界\x1b[0m".as_bytes());
-        let grid = Grid::capture(&terminal)?;
+        let grid = Grid::capture(&terminal, &mut crate::graphics::Images::new()?)?;
         assert_eq!((grid.cols, grid.rows), (12, 4));
         assert_eq!(grid.cells.len(), 48);
         assert_eq!(grid.cells[0].fg, [10, 20, 30]);
@@ -380,7 +469,11 @@ mod tests {
         assert!(grid.cells[1].wide && grid.cells[2].tail);
         assert_eq!(grid.cursor, Some((3, 0)));
         terminal.vt_write(b"\x1b[?25l");
-        assert!(Grid::capture(&terminal)?.cursor.is_none());
+        assert!(
+            Grid::capture(&terminal, &mut crate::graphics::Images::new()?)?
+                .cursor
+                .is_none()
+        );
         Ok(())
     }
     #[test]
@@ -395,7 +488,7 @@ mod tests {
         })?;
         terminal.vt_write(b"\x1b[48;2;20;24;32m\x1b[2J\x1b[H\x1b[38;2;80;220;160mrex-attach image preview\r\n\x1b[0;48;2;20;24;32m\r\n");
         terminal.vt_write("Regular text  café e\u{301}\r\n\x1b[1mBold\x1b[0m  \x1b[3mItalic\x1b[0m  \x1b[4mUnderline\x1b[0m\r\n\r\n\x1b[31mRed \x1b[32mGreen \x1b[34mBlue\x1b[0m\r\n\r\n$ ".as_bytes());
-        let grid = Grid::capture(&terminal)?;
+        let grid = Grid::capture(&terminal, &mut crate::graphics::Images::new()?)?;
         let image = raster.render(&grid).to_rgba8();
         assert_eq!(image.dimensions(), (540, 216));
         assert_eq!(image.get_pixel(539, 215).0[3], 255);

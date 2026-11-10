@@ -1,9 +1,9 @@
 use crate::stream::SnapshotBuffer;
-use anyhow::{Result, ensure};
-use ghostty_vt::{
+use crate::vt::{
     RenderState, Terminal,
     render::{CellIterator, RowIterator},
 };
+use anyhow::{Result, ensure};
 use serde_json::Value;
 
 pub struct State {
@@ -36,7 +36,7 @@ impl State {
     }
     pub fn render_held(&mut self, now: std::time::Instant) -> Result<bool> {
         let held = match &self.terminal {
-            Some(t) => t.mode(ghostty_vt::terminal::Mode::SYNC_OUTPUT)?,
+            Some(t) => t.mode(crate::vt::terminal::Mode::SYNC_OUTPUT)?,
             None => false,
         };
         if !held {
@@ -74,7 +74,15 @@ impl State {
                             .as_u64()
                             .filter(|n| (1..=65535).contains(n))
                             .ok_or_else(|| anyhow::anyhow!("invalid rows"))?;
-                        terminal.resize(cols as u16, rows as u16, 0, 0)?;
+                        let metric = |name: &str| {
+                            value[name].as_u64().filter(|n| *n <= 4096).unwrap_or(0) as u32
+                        };
+                        terminal.resize(
+                            cols as u16,
+                            rows as u16,
+                            metric("cell_width_px"),
+                            metric("cell_height_px"),
+                        )?;
                     }
                 }
             }
@@ -91,7 +99,7 @@ pub fn route_input(
     size: (u16, u16),
 ) -> Result<Vec<crate::shortcuts::Event>> {
     use crate::shortcuts::Event;
-    use ghostty_vt::{
+    use crate::vt::{
         screen::Screen,
         terminal::{Mode, ScrollViewport},
     };
@@ -151,7 +159,7 @@ pub fn frame(terminal: &mut Terminal, width: u16, height: u16, ansi: bool) -> Re
 }
 
 fn text_row(
-    row: &ghostty_vt::render::RowIteration<'_>,
+    row: &crate::vt::render::RowIteration<'_>,
     cells: &mut CellIterator,
     text: &mut String,
     out: &mut String,
@@ -164,11 +172,14 @@ fn text_row(
             break;
         }
         x += 1;
-        if cell.raw_cell()?.wide()? == ghostty_vt::screen::CellWide::SpacerTail {
+        if cell.raw_cell()?.wide()? == crate::vt::screen::CellWide::SpacerTail {
             continue;
         }
         text.clear();
         cell.graphemes_utf8(text)?;
+        if text.starts_with("\u{10eeee}") {
+            text.clear();
+        }
         if text.is_empty() || cell.style()?.invisible {
             out.push(' ');
         } else {
@@ -188,24 +199,61 @@ pub enum Backend {
     Ratatui,
 }
 
-pub enum Renderer {
+enum TextRenderer {
     Ansi(ansi::Renderer),
     Ratatui(ratatui_backend::Renderer),
 }
 
+pub struct Renderer {
+    text: TextRenderer,
+    graphics: Option<crate::graphics::output::Output>,
+    images: Option<crate::graphics::Images>,
+}
+
 impl Renderer {
     pub fn new(backend: Backend) -> Result<Self> {
-        match backend {
-            Backend::Ansi => Ok(Self::Ansi(ansi::Renderer::new()?)),
-            Backend::Ratatui => Ok(Self::Ratatui(ratatui_backend::Renderer::new()?)),
+        let text = match backend {
+            Backend::Ansi => TextRenderer::Ansi(ansi::Renderer::new()?),
+            Backend::Ratatui => TextRenderer::Ratatui(ratatui_backend::Renderer::new()?),
+        };
+        Ok(Self {
+            text,
+            graphics: None,
+            images: None,
+        })
+    }
+
+    pub fn with_graphics(mut self, cell: Option<[u32; 2]>) -> Result<Self> {
+        self.graphics = cell.map(crate::graphics::output::Output::new).transpose()?;
+        self.images = cell.map(|_| crate::graphics::Images::new()).transpose()?;
+        Ok(self)
+    }
+    pub fn images_pending(&self) -> bool {
+        self.graphics.as_ref().is_some_and(|g| g.pending())
+    }
+    pub fn clear_images(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(graphics) = &mut self.graphics {
+            let mut out = std::io::stdout().lock();
+            out.write_all(graphics.clear().as_bytes())?;
+            out.flush()?;
         }
+        Ok(())
     }
 
     pub fn frame(&mut self, terminal: &Terminal, width: u16, height: u16) -> Result<String> {
-        match self {
-            Self::Ansi(renderer) => renderer.frame(terminal, width, height),
-            Self::Ratatui(renderer) => renderer.frame(terminal, width, height),
+        let (mut text, images) = match &mut self.text {
+            TextRenderer::Ansi(renderer) => {
+                renderer.frame_images(terminal, width, height, self.images.as_mut())?
+            }
+            TextRenderer::Ratatui(renderer) => {
+                renderer.frame_images(terminal, width, height, self.images.as_mut())?
+            }
+        };
+        if let Some(graphics) = &mut self.graphics {
+            text.push_str(&graphics.frame(terminal, (width, height), images)?);
         }
+        Ok(text)
     }
 }
 
@@ -215,48 +263,67 @@ pub enum Part {
     Metadata(Value),
 }
 
-/// Retains partial escape prefixes across frames and reconnects. Only a Rex
-/// APC with this channel's nonce is interpreted as transport metadata.
+/// Incremental recognizer for the nonce-qualified Rex metadata marker. A
+/// failed marker probe is emitted unchanged; JSON is bounded before decoding.
 pub struct ApcParser {
-    prefix: Vec<u8>,
-    pending: Vec<u8>,
+    signature: Vec<u8>,
+    probe: Vec<u8>,
+    json: Option<Vec<u8>>,
+    escaped: bool,
 }
-
 impl ApcParser {
     pub fn new(nonce: u64) -> Self {
         Self {
-            prefix: format!("\x1b_rex1;{nonce};").into_bytes(),
-            pending: Vec::new(),
+            signature: format!("\x1b_rex1;{nonce};").into_bytes(),
+            probe: vec![],
+            json: None,
+            escaped: false,
         }
     }
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Part>> {
-        let mut parts = Vec::new();
-        let mut output = Vec::new();
-        for &byte in bytes {
-            self.pending.push(byte);
-            loop {
-                if self.pending.starts_with(&self.prefix) {
-                    ensure!(self.pending.len() <= 1024 * 1024, "Rex APC exceeds 1 MiB");
-                    if self.pending.ends_with(b"\x1b\\") {
-                        if !output.is_empty() {
-                            parts.push(Part::Output(std::mem::take(&mut output)));
-                        }
-                        let json = &self.pending[self.prefix.len()..self.pending.len() - 2];
-                        parts.push(Part::Metadata(serde_json::from_slice(json)?));
-                        self.pending.clear();
+    pub fn feed(&mut self, input: &[u8]) -> Result<Vec<Part>> {
+        let mut result = vec![];
+        let mut plain = vec![];
+        for &byte in input {
+            if let Some(json) = self.json.as_mut() {
+                if self.escaped && byte == b'\\' {
+                    json.pop(); // The ESC introducing ST is not part of JSON.
+                    let metadata = serde_json::from_slice(json)?;
+                    if !plain.is_empty() {
+                        result.push(Part::Output(std::mem::take(&mut plain)));
                     }
-                    break;
+                    result.push(Part::Metadata(metadata));
+                    self.json = None;
+                    self.escaped = false;
+                } else {
+                    json.push(byte);
+                    self.escaped = byte == 0x1b;
+                    ensure!(
+                        json.len() + self.signature.len() + 2 <= 1024 * 1024,
+                        "Rex APC exceeds 1 MiB"
+                    );
                 }
-                if self.prefix.starts_with(&self.pending) {
-                    break;
+                continue;
+            }
+            self.probe.push(byte);
+            if self.probe == self.signature {
+                self.probe.clear();
+                self.json = Some(vec![]);
+            } else if !self.signature.starts_with(&self.probe) {
+                // ESC occurs only at the start of the marker, so at most this
+                // final byte can begin another probe after a mismatch.
+                if byte == 0x1b {
+                    self.probe.pop();
+                    plain.append(&mut self.probe);
+                    self.probe.push(byte);
+                } else {
+                    plain.append(&mut self.probe);
                 }
-                output.push(self.pending.remove(0));
             }
         }
-        if !output.is_empty() {
-            parts.push(Part::Output(output));
+        if !plain.is_empty() {
+            result.push(Part::Output(plain));
         }
-        Ok(parts)
+        Ok(result)
     }
 }
 
@@ -264,7 +331,32 @@ impl ApcParser {
 mod tests {
     use super::ratatui_backend::Renderer;
     use super::*;
-    use ghostty_vt::{TerminalOptions, snapshot};
+    use crate::vt::{TerminalOptions, snapshot};
+
+    #[tokio::test]
+    async fn embedded_images_and_text_share_dirty_tracking_on_both_backends() -> Result<()> {
+        for backend in [Backend::Ansi, Backend::Ratatui] {
+            let mut source = crate::graphics::tests::terminal()?;
+            let mut display = crate::graphics::tests::terminal()?;
+            crate::graphics::tests::transmit(&mut source, 42, [255, 0, 0, 255], "c=2,r=2");
+            let mut renderer = super::Renderer::new(backend)?.with_graphics(Some([10, 20]))?;
+            for marker in ["BEFORE", "AFTER"] {
+                source.vt_write(format!("\x1b[1;5H{marker}").as_bytes());
+                for _ in 0..300 {
+                    display.vt_write(renderer.frame(&source, 12, 6)?.as_bytes());
+                    if !renderer.images_pending() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                assert!(frame(&mut display, 12, 6, false)?.contains(marker));
+                assert_eq!(crate::graphics::Reader::new()?.capture(&display)?.len(), 1);
+            }
+            let clear = renderer.graphics.as_mut().unwrap().clear();
+            display.vt_write(clear.as_bytes());
+        }
+        Ok(())
+    }
 
     #[test]
     fn mouse_routing_respects_tracking_history_and_alternate_scroll() -> Result<()> {
@@ -292,7 +384,7 @@ mod tests {
                 frame(&mut display, 120, 4, false)?,
                 frame(&mut terminal, 120, 4, false)?
             );
-            terminal.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Bottom);
+            terminal.scroll_viewport(crate::vt::terminal::ScrollViewport::Bottom);
             display.vt_write(renderer.frame(&terminal, 120, 4)?.as_bytes());
             assert_eq!(
                 frame(&mut display, 120, 4, false)?,
@@ -516,8 +608,8 @@ mod tests {
             frame(&mut original, 20, 3, true)?
         );
         // Older rows must survive full decode as well as the visible screen.
-        original.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Top);
-        restored.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Top);
+        original.scroll_viewport(crate::vt::terminal::ScrollViewport::Top);
+        restored.scroll_viewport(crate::vt::terminal::ScrollViewport::Top);
         let history = frame(restored, 20, 3, false)?;
         assert!(history.contains("line 0"));
         assert_eq!(history, frame(&mut original, 20, 3, false)?);
@@ -534,8 +626,8 @@ mod tests {
         original.vt_write("界 café e\u{301}\r\nsecond".as_bytes());
         let encoded = snapshot::encode(&original)?;
         let mut state = State::new(42);
-        for byte in encoded.as_ref() {
-            state.feed(&[*byte])?;
+        for &byte in &encoded {
+            state.feed(&[byte])?;
         }
         state.feed(b"\r\nlast\x1b_rex1;42;{\"type\":\"resize\",\"cols\":25,\"rows\":4}\x1b\\")?;
         let text = frame(state.terminal.as_mut().unwrap(), 25, 4, false)?;

@@ -231,8 +231,8 @@ fn resolved_target(reply: &Value, kind: &str, query: &str) -> Result<crate::wire
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vt::{Terminal, TerminalOptions, snapshot};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use ghostty_vt::{Terminal, TerminalOptions, snapshot};
     use tokio_tungstenite::tungstenite::protocol::Role;
 
     async fn pair() -> (Socket, Socket) {

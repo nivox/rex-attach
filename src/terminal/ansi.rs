@@ -7,7 +7,7 @@ pub struct Renderer {
     painter: RowPainter,
     lines: Vec<String>,
     dimensions: Option<(u16, u16, u16, u16)>,
-    background: Option<ghostty_vt::style::RgbColor>,
+    background: Option<crate::vt::style::RgbColor>,
     cursor: Option<Option<(u16, u16)>>,
 }
 
@@ -24,10 +24,24 @@ impl Renderer {
         })
     }
 
+    #[cfg(test)]
     pub fn frame(&mut self, terminal: &Terminal, width: u16, height: u16) -> Result<String> {
-        use ghostty_vt::render::Dirty;
+        Ok(self.frame_images(terminal, width, height, None)?.0)
+    }
+    pub(super) fn frame_images(
+        &mut self,
+        terminal: &Terminal,
+        width: u16,
+        height: u16,
+        images: Option<&mut crate::graphics::Images>,
+    ) -> Result<(String, Vec<crate::graphics::Image>)> {
+        use crate::vt::render::Dirty;
         use std::fmt::Write;
         let snapshot = self.state.update(terminal)?;
+        let images = images
+            .map(|cache| cache.capture(terminal, &snapshot))
+            .transpose()?
+            .unwrap_or_default();
         let dimensions = (width, height, snapshot.cols()?, snapshot.rows()?);
         let defaults = snapshot.colors()?;
         // A background change must also repaint padding outside the block.
@@ -79,11 +93,11 @@ impl Renderer {
         self.dimensions = Some(dimensions);
         self.background = Some(defaults.background);
         if body.is_empty() && self.cursor == Some(cursor) {
-            return Ok(String::new());
+            return Ok((String::new(), images));
         }
         let out = finish_frame(&body, cursor)?;
         self.cursor = Some(cursor);
-        Ok(out)
+        Ok((out, images))
     }
 }
 
@@ -100,8 +114,8 @@ impl RowPainter {
     }
     fn paint(
         &mut self,
-        row: &ghostty_vt::render::RowIteration<'_>,
-        defaults: &ghostty_vt::render::Colors,
+        row: &crate::vt::render::RowIteration<'_>,
+        defaults: &crate::vt::render::Colors,
         width: u16,
     ) -> Result<()> {
         self.line.scratch.clear();
@@ -135,8 +149,8 @@ fn finish_frame(body: &str, cursor: Option<(u16, u16)>) -> Result<String> {
 }
 
 type StyleKey = (
-    ghostty_vt::style::RgbColor,
-    ghostty_vt::style::RgbColor,
+    crate::vt::style::RgbColor,
+    crate::vt::style::RgbColor,
     bool,
     bool,
 );
@@ -149,11 +163,11 @@ struct Line {
 impl Line {
     fn paint(
         &mut self,
-        cell: &ghostty_vt::render::CellIteration<'_>,
-        defaults: &ghostty_vt::render::Colors,
+        cell: &crate::vt::render::CellIteration<'_>,
+        defaults: &crate::vt::render::Colors,
         visible_width: u16,
     ) -> Result<()> {
-        use ghostty_vt::screen::CellWide;
+        use crate::vt::screen::CellWide;
         use std::fmt::Write;
         let wide = cell.raw_cell()?.wide()?;
         if wide == CellWide::SpacerTail {
@@ -182,6 +196,9 @@ impl Line {
         }
         self.text.clear();
         cell.graphemes_utf8(&mut self.text)?;
+        if self.text.starts_with("\u{10eeee}") {
+            self.text.clear();
+        }
         if wide == CellWide::SpacerHead || (wide == CellWide::Wide && visible_width < 2) {
             self.scratch.push(' ');
         } else if self.text.is_empty() || style.invisible {

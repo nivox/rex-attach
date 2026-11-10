@@ -2,6 +2,7 @@ mod action;
 mod actions;
 mod activity;
 mod browser;
+mod graphics;
 mod help;
 mod mouse;
 mod preview;
@@ -11,6 +12,7 @@ mod shortcuts;
 mod stream;
 mod terminal;
 mod tty;
+mod vt;
 mod wire;
 
 mod app;

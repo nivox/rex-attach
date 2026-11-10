@@ -32,11 +32,11 @@ impl Options {
     pub async fn detect(
         mode: Mode,
         font: Option<&Path>,
-        input: &mut crate::tty::Input,
+        detected: Option<Graphics>,
     ) -> Result<Self> {
         let graphics = match mode {
             Mode::Text => return Ok(Self::default()),
-            Mode::Kitty => probe(input).await?.unwrap_or(Graphics {
+            Mode::Kitty => detected.unwrap_or(Graphics {
                 font: ratatui_image::FontSize::new(10, 20),
                 tmux: std::env::var_os("TMUX").is_some(),
                 compress: false,
@@ -50,7 +50,7 @@ impl Options {
             {
                 return Ok(Self::default());
             }
-            Mode::Auto => match probe(input).await? {
+            Mode::Auto => match detected {
                 Some(g) => g,
                 None => return Ok(Self::default()),
             },
@@ -64,7 +64,7 @@ impl Options {
         Ok(Self {
             graphics: Some(graphics),
             raster: Some(Arc::new(Mutex::new(raster))),
-            image_jobs: Some(Arc::new(tokio::sync::Semaphore::new(1))),
+            image_jobs: Some(crate::graphics::jobs()),
         })
     }
     pub fn images(&self) -> bool {
@@ -103,10 +103,10 @@ impl Options {
 }
 
 #[derive(Clone)]
-struct Graphics {
-    font: ratatui_image::FontSize,
-    tmux: bool,
-    compress: bool,
+pub(crate) struct Graphics {
+    pub(crate) font: ratatui_image::FontSize,
+    pub(crate) tmux: bool,
+    pub(crate) compress: bool,
 }
 
 // Probe with our existing async tty reader. A timed-out probe must not leave a
@@ -168,7 +168,7 @@ impl Probe {
         }
     }
 }
-async fn probe(input: &mut crate::tty::Input) -> Result<Option<Graphics>> {
+pub(crate) async fn probe(input: &mut crate::tty::Input) -> Result<Option<Graphics>> {
     use std::io::Write;
     let tmux = std::env::var_os("TMUX").is_some();
     let query = Parser::query(
@@ -338,10 +338,8 @@ async fn render(
     let deadline = tokio::time::sleep(Duration::from_secs(30));
     tokio::pin!(deadline);
     let mut last_grid = None;
-    static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-    let id = (std::process::id().wrapping_mul(2654435761)
-        ^ NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-    .max(1);
+    let mut images = crate::graphics::Images::new()?;
+    let id = crate::graphics::next_id();
     loop {
         tokio::select! {
             bytes = stream::next_binary(&mut data) => { state.feed(&bytes?)?; dirty = true; },
@@ -350,7 +348,7 @@ async fn render(
                 if state.render_held(std::time::Instant::now())? { continue; }
                 let text = terminal::frame(state.terminal_mut()?,width,height,false)?;
                 if options.images() && width>0 && height>0 {
-                    let grid=crate::raster::Grid::capture(state.terminal()?)?;
+                    let grid=crate::raster::Grid::capture(state.terminal()?,&mut images)?;
                     if last_grid.as_ref()!=Some(&grid) {
                         // A cancelled spawn_blocking job keeps its permit until
                         // encoding finishes. Selection changes cannot queue more.

@@ -7,7 +7,17 @@ pub async fn resize(
     control: &mut protocol::Control,
     size: (u16, u16),
 ) -> Result<()> {
-    control.call("com.superlogical.terminal.resize",json!({"session_id":target.session,"block_id":target.block,"args":{"columns":size.0,"rows":size.1}})).await?;
+    let mut args = json!({"columns":size.0,"rows":size.1});
+    if let Some((width, height)) = crate::tty::cell_pixels() {
+        args["cell_width_px"] = json!(width);
+        args["cell_height_px"] = json!(height);
+    }
+    control
+        .call(
+            "com.superlogical.terminal.resize",
+            json!({"session_id":target.session,"block_id":target.block,"args":args}),
+        )
+        .await?;
     Ok(())
 }
 
@@ -53,12 +63,12 @@ pub async fn while_streaming<T>(
     operation: impl std::future::Future<Output = Result<T>>,
     data: &mut protocol::Socket,
     state: &mut terminal::State,
-    mut draw: impl FnMut(&mut terminal::State) -> Result<()>,
+    mut draw: impl FnMut(&mut terminal::State) -> Result<bool>,
 ) -> Result<T> {
     tokio::pin!(operation);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(16));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut dirty = false;
+    let mut dirty = state.is_ready();
     let mut output_error = None;
     loop {
         tokio::select! {
@@ -72,7 +82,7 @@ pub async fn while_streaming<T>(
             _ = tick.tick(), if dirty && state.is_ready() && output_error.is_none() => {
                 match state.render_held(std::time::Instant::now()) {
                     Ok(true) => {},
-                    Ok(false) => { output_error = draw(state).err(); dirty = false; },
+                    Ok(false) => match draw(state) {Ok(pending)=>dirty=pending,Err(error)=>output_error=Some(error)},
                     Err(error) => output_error = Some(error),
                 }
             }
@@ -87,6 +97,46 @@ mod tests {
         protocol::next_json,
         test_support::{control_pair, reply},
     };
+
+    #[tokio::test]
+    async fn pending_graphics_are_drawn_during_an_rpc_without_more_remote_output() -> Result<()> {
+        let (mut client, mut server) = crate::test_support::socket_pair().await;
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let terminal = crate::vt::Terminal::new(crate::vt::TerminalOptions::default())?;
+        server
+            .send(Message::Binary(
+                crate::vt::snapshot::encode(&terminal)?.to_vec().into(),
+            ))
+            .await?;
+        let mut state = terminal::State::new(1);
+        let (complete, result) = tokio::sync::oneshot::channel();
+        let mut complete = Some(complete);
+        let mut frames = 0;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            while_streaming(
+                async {
+                    result.await?;
+                    Ok(())
+                },
+                &mut client,
+                &mut state,
+                |_| {
+                    frames += 1;
+                    if frames == 1 {
+                        return Ok(true);
+                    }
+                    complete.take().unwrap().send(()).unwrap();
+                    Ok(false)
+                },
+            ),
+        )
+        .await??;
+        assert_eq!(frames, 2);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn operation_and_cleanup_failures_are_both_preserved() -> Result<()> {
         for (operation_fails, detach_fails) in
@@ -169,13 +219,13 @@ mod tests {
         use futures_util::SinkExt;
         use tokio_tungstenite::tungstenite::Message;
         let (mut client, mut server) = crate::test_support::socket_pair().await;
-        let mut terminal = ghostty_vt::Terminal::new(ghostty_vt::TerminalOptions {
+        let mut terminal = crate::vt::Terminal::new(crate::vt::TerminalOptions {
             cols: 20,
             rows: 2,
             ..Default::default()
         })?;
         terminal.vt_write(b"output during RPC");
-        let bytes = ghostty_vt::snapshot::encode(&terminal)?.to_vec();
+        let bytes = crate::vt::snapshot::encode(&terminal)?.to_vec();
         server.send(Message::Binary(bytes.into())).await?;
         let (complete, result) = tokio::sync::oneshot::channel();
         let mut complete = Some(complete);
@@ -194,7 +244,7 @@ mod tests {
                     .expect("draw before completion")
                     .send(())
                     .unwrap();
-                Ok(())
+                Ok(false)
             }),
         )
         .await??;
@@ -210,7 +260,7 @@ mod tests {
             Ok(())
         };
         let mut state = terminal::State::new(42);
-        let pending = while_streaming(operation, &mut data, &mut state, |_| Ok(()));
+        let pending = while_streaming(operation, &mut data, &mut state, |_| Ok(false));
         tokio::pin!(pending);
         tokio::select! {
             biased;
