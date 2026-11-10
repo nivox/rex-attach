@@ -69,6 +69,15 @@
             CARGO_BUILD_TARGET = releaseTarget;
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C target-feature=+crt-static -C linker=rust-lld";
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C target-feature=+crt-static -C linker=rust-lld";
+            # Portable macOS releases must use the host Apple SDK and tools.
+            # Nix's compiler wrapper links libraries from the Nix store.
+            shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              export SDKROOT="$(/usr/bin/env -u SDKROOT /usr/bin/xcrun --sdk macosx --show-sdk-path)"
+              export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang
+              export CC_aarch64_apple_darwin=/usr/bin/clang
+              export CXX_aarch64_apple_darwin=/usr/bin/clang++
+              export AR_aarch64_apple_darwin=/usr/bin/ar
+            '';
           };
         });
     };

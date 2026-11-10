@@ -85,6 +85,7 @@ jobs:
             fi
           else
             libraries=$(otool -L "$binary")
+            printf '%s\n' "$libraries"
             if [[ "$libraries" == */nix/store/* ]]; then
               echo 'macOS release binary must not depend on the Nix store' >&2
               exit 1
