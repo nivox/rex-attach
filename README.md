@@ -1,9 +1,13 @@
 # rex-attach
 
-A Unix terminal client for existing terminal blocks on a local Rex server.
+A Unix terminal client for a local Rex server.
 Browse sessions, tabs, and blocks with a live preview, or attach directly to a
 block and use it from your terminal. This also works over SSH when run on the
 machine hosting Rex.
+
+## Demo
+[recording.webm](https://github.com/user-attachments/assets/c1e79784-9ac1-4e3a-a7b0-5701e2a2edf7)
+
 
 ## Build
 
