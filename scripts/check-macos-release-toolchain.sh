@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Exercise the release linker before spending time building all dependencies.
 set -euo pipefail
+printf 'DEVELOPER_DIR=%s\nSDKROOT=%s\n' "$DEVELOPER_DIR" "$SDKROOT"
+if [[ "$DEVELOPER_DIR:$SDKROOT" == */nix/store/* ]]; then
+  echo 'macOS release environment still selects the Nix SDK' >&2
+  exit 1
+fi
 probe_dir=$(mktemp -d)
 trap 'rm -rf "$probe_dir"' EXIT
 printf 'fn main() { println!("release linker probe"); }\n' > "$probe_dir/probe.rs"

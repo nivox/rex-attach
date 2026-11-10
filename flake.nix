@@ -76,7 +76,11 @@
             # Portable macOS releases must use the host Apple SDK and tools.
             # Nix's compiler wrapper links libraries from the Nix store.
             shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
-              export SDKROOT="$(/usr/bin/env -u SDKROOT /usr/bin/xcrun --sdk macosx --show-sdk-path)"
+              # Nix's SDK hook also sets DEVELOPER_DIR. Clearing SDKROOT alone
+              # leaves xcrun selecting the Nix SDK through that directory.
+              unset SDKROOT DEVELOPER_DIR TOOLCHAINS
+              export DEVELOPER_DIR="$(/usr/bin/xcode-select --print-path)"
+              export SDKROOT="$(/usr/bin/xcrun --no-cache --sdk macosx --show-sdk-path)"
               export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="${./scripts/macos-release-cc.sh}"
               export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="-L native=$SDKROOT/usr/lib"
               export CC_aarch64_apple_darwin="$CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"

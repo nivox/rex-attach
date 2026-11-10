@@ -13,8 +13,10 @@ installation (selected with `xcode-select`). This keeps the release binary's
 runtime libraries independent of the Nix store. The release toolchain disables
 rust-overlay's propagated Nix `libiconv` dependency and searches the Apple SDK's
 libraries explicitly, so Rust's standard library links against system `libiconv`.
-The compiler wrapper also selects Apple's `ld` explicitly and clears inherited
-library search variables. CI first compiles and runs a small Rust probe, prints
+The release shell resets both `DEVELOPER_DIR` and `SDKROOT` to the active Xcode
+installation; Nix's SDK hook sets both variables. The compiler wrapper also
+selects Apple's `ld` explicitly and clears inherited library and dynamic loader
+search variables. CI first compiles and runs a small Rust probe, prints
 the selected linker, and checks its libraries for Nix store paths. It repeats the
 library check on the final binary before packaging.
 
