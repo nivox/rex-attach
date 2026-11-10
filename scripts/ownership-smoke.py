@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Verify automatic sizing with two attached clients in a disposable session."""
+from smoke_support import Screen, api_client, open_terminal, controlling_terminal, set_size
 import argparse
 import fcntl
-import json
 import os
-import pty
 import re
 import select
 import signal
-import struct
 import subprocess
 import tempfile
 import termios
@@ -21,9 +19,7 @@ def main():
     parser.add_argument('--socket', required=True)
     parser.add_argument('--binary', default='target/debug/rex-attach')
     args = parser.parse_args()
-    rex = ['rex', '--autostart=false', '--server', args.socket, 'api', 'call']
-    def api(method, payload):
-        return json.loads(subprocess.check_output(rex+[method, json.dumps(payload)], timeout=15))
+    api = api_client(args.socket)
     created = api('session.create', {'label': 'ownership-'+uuid.uuid4().hex[:6], 'initial_windows': [
         {'layout': {'block': {'flavor': 'com.superlogical.terminal.shell'}}}
     ]})
@@ -40,29 +36,25 @@ def main():
     def drain():
         for client in clients:
             while select.select([client['master']], [], [], .01)[0]:
-                client['output'].extend(os.read(client['master'], 65536))
+                chunk = os.read(client['master'], 65536)
+                client['output'].extend(chunk)
+                client['screen'].feed(chunk)
     def wait(test, message):
         deadline = time.monotonic()+12
         while time.monotonic()<deadline:
             drain()
             assert all(c['process'].poll() is None for c in clients), 'client exited unexpectedly'
             if test(): return
-        raise AssertionError(message)
+        raise AssertionError(f"{message}; dimensions={dimensions()}; owner={owner()}; outputs=" + repr([c['screen'].lines()[-1] for c in clients]))
     def visible(client, text):
-        return text in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', client['output'])
+        return text.decode() in '\n'.join(client['screen'].lines())
     try:
         with tempfile.TemporaryDirectory(prefix='rex-attach-sizing-config-') as config:
             env = {**os.environ, 'TERM': 'xterm-256color', 'XDG_CONFIG_DIR': config}
             def spawn(cols, rows, extra=()):
-                master, slave = pty.openpty()
-                before = termios.tcgetattr(slave)
-                flags = fcntl.fcntl(slave, fcntl.F_GETFL)
-                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
-                def setup():
-                    os.setsid()
-                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-                process = subprocess.Popen(command+['--preview','text']+list(extra), stdin=slave, stdout=slave, stderr=slave, preexec_fn=setup, env=env)
-                client = dict(master=master, slave=slave, process=process, before=before, flags=flags, output=bytearray())
+                master, slave, before, flags = open_terminal(cols, rows)
+                process = subprocess.Popen(command+['--preview','text']+list(extra), stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_terminal, env=env)
+                client = dict(master=master, slave=slave, process=process, before=before, flags=flags, output=bytearray(), screen=Screen(cols, rows))
                 clients.append(client)
                 return client
             first = spawn(80, 24, ['--take'])  # compatibility flag still accepted
@@ -73,7 +65,8 @@ def main():
             assert dimensions()==(80,24) and owner()==first_owner
             second = spawn(120, 40)  # default behavior must override the first owner
             wait(lambda:dimensions()==(120,40) and owner()!=first_owner, 'second attachment takes sizing ownership')
-            fcntl.ioctl(second['slave'], termios.TIOCSWINSZ, struct.pack('HHHH',30,100,0,0))
+            second['screen'] = Screen(100, 30)
+            set_size(second['slave'], 100, 30)
             os.kill(second['process'].pid, signal.SIGWINCH)
             wait(lambda:dimensions()==(100,30), 'local terminal resize updates shared block')
             os.write(second['master'], b'\x02d')

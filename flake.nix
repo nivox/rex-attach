@@ -22,6 +22,7 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
+              python3
               rustc
               rustfmt
               clippy

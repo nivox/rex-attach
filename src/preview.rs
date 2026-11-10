@@ -1,8 +1,4 @@
-use crate::{
-    Target,
-    protocol::{self, Control},
-    stream, terminal,
-};
+use crate::{domain::Target, protocol::Control, stream, terminal};
 use anyhow::{Context, Result};
 use ratatui_image::{
     picker::{
@@ -11,7 +7,6 @@ use ratatui_image::{
     },
     protocol::{Protocol, kitty::Kitty},
 };
-use serde_json::json;
 use std::time::Duration;
 use std::{
     path::Path,
@@ -31,6 +26,7 @@ pub enum Mode {
 pub struct Options {
     graphics: Option<Graphics>,
     raster: Option<Arc<Mutex<crate::raster::Rasterizer>>>,
+    image_jobs: Option<Arc<tokio::sync::Semaphore>>,
 }
 impl Options {
     pub async fn detect(
@@ -68,6 +64,7 @@ impl Options {
         Ok(Self {
             graphics: Some(graphics),
             raster: Some(Arc::new(Mutex::new(raster))),
+            image_jobs: Some(Arc::new(tokio::sync::Semaphore::new(1))),
         })
     }
     pub fn images(&self) -> bool {
@@ -126,43 +123,47 @@ struct Probe {
 impl Probe {
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            if self.sequence.is_empty() {
-                if byte == 0x1b {
-                    self.sequence.push(byte);
-                } else {
-                    self.keys.push(byte);
-                }
-                continue;
+            self.byte(byte);
+        }
+    }
+    fn byte(&mut self, byte: u8) {
+        if self.sequence.is_empty() {
+            if byte == 0x1b {
+                self.sequence.push(byte);
+            } else {
+                self.keys.push(byte);
             }
-            self.sequence.push(byte);
-            let csi = self.sequence.starts_with(b"\x1b[");
-            let apc = self.sequence.starts_with(b"\x1b_G");
-            let finished = (csi && self.sequence.len() > 2 && (0x40..=0x7e).contains(&byte))
-                || (apc && self.sequence.ends_with(b"\x1b\\"));
-            if finished {
-                if apc || (csi && b"ntc".contains(&byte)) {
-                    let mut parser = Parser::default();
-                    for ch in String::from_utf8_lossy(&self.sequence).chars() {
-                        for response in parser.push(ch) {
-                            match response {
-                                Response::Kitty => self.kitty = true,
-                                Response::KittyCompression => self.compress = true,
-                                Response::CellSize(Some((w, h))) if w > 0 && h > 0 => {
-                                    self.font = Some((w, h))
-                                }
-                                Response::Status => self.done = true,
-                                _ => {}
-                            }
-                        }
-                    }
-                } else {
-                    self.keys.extend_from_slice(&self.sequence);
+            return;
+        }
+        self.sequence.push(byte);
+        let csi = self.sequence.starts_with(b"\x1b[");
+        let apc = self.sequence.starts_with(b"\x1b_G");
+        let finished = (csi && self.sequence.len() > 2 && (0x40..=0x7e).contains(&byte))
+            || (apc && self.sequence.ends_with(b"\x1b\\"));
+        if finished {
+            if apc || (csi && b"ntc".contains(&byte)) {
+                self.reply();
+            } else {
+                self.keys.extend_from_slice(&self.sequence);
+            }
+            self.sequence.clear();
+        } else if (self.sequence.len() == 2 && byte != b'[' && byte != b'_')
+            || self.sequence.len() > 4096
+        {
+            self.keys.append(&mut self.sequence);
+        }
+    }
+    fn reply(&mut self) {
+        let mut parser = Parser::default();
+        for ch in String::from_utf8_lossy(&self.sequence).chars() {
+            for response in parser.push(ch) {
+                match response {
+                    Response::Kitty => self.kitty = true,
+                    Response::KittyCompression => self.compress = true,
+                    Response::CellSize(Some((w, h))) if w > 0 && h > 0 => self.font = Some((w, h)),
+                    Response::Status => self.done = true,
+                    _ => {}
                 }
-                self.sequence.clear();
-            } else if (self.sequence.len() == 2 && byte != b'[' && byte != b'_')
-                || self.sequence.len() > 4096
-            {
-                self.keys.append(&mut self.sequence);
             }
         }
     }
@@ -308,19 +309,13 @@ async fn worker(
         result = Control::connect(socket) => result?,
         _ = &mut *cancelled => return Ok(()),
     };
-    control
-        .call("session.attach", json!({"session_id":target.session}))
-        .await?;
-    let result = tokio::select! {
-        result = render(&mut control, socket, target, size, options, tx) => result,
+    // Cancellation abandons this dedicated connection, never a reused RPC stream.
+    tokio::select! {
+        result = crate::session::with_session(&mut control, &target.session, async |control, _| {
+            render(control, socket, target, size, options, tx).await
+        }) => result,
         _ = &mut *cancelled => Ok(()),
-    };
-    let detached = control
-        .call("session.detach", json!({"session_id":target.session}))
-        .await;
-    result?;
-    detached?;
-    Ok(())
+    }
 }
 
 async fn render(
@@ -332,16 +327,7 @@ async fn render(
     tx: &watch::Sender<Frame>,
 ) -> Result<()> {
     let (width, height) = size;
-    let ticket = control.call("data.connect",json!({"session_id":target.session,"block_id":target.block,"data_ref_id":"terminal","subprotocol":stream::PROTOCOL})).await?;
-    let mut data = protocol::socket(socket, "/api/data", stream::PROTOCOL).await?;
-    let welcome = stream::handshake(
-        &mut data,
-        ticket["ticket"]
-            .as_str()
-            .context("missing preview data ticket")?,
-    )
-    .await?;
-    let mut state = terminal::State::new(welcome.nonce);
+    let (mut data, mut state) = crate::session::open_terminal(control, socket, target).await?;
     let mut tick = tokio::time::interval(Duration::from_millis(if options.images() {
         400
     } else {
@@ -359,22 +345,25 @@ async fn render(
     loop {
         tokio::select! {
             bytes = stream::next_binary(&mut data) => { state.feed(&bytes?)?; dirty = true; },
-            _ = &mut deadline, if state.terminal.is_none() => anyhow::bail!("snapshot restoration timed out"),
-            _ = tick.tick(), if dirty && state.terminal.is_some() => {
+            _ = &mut deadline, if !state.is_ready() => anyhow::bail!("snapshot restoration timed out"),
+            _ = tick.tick(), if dirty && state.is_ready() => {
                 if state.render_held(std::time::Instant::now())? { continue; }
-                let text = terminal::frame(state.terminal.as_mut().unwrap(),width,height,false)?;
+                let text = terminal::frame(state.terminal_mut()?,width,height,false)?;
                 if options.images() && width>0 && height>0 {
-                    let grid=crate::raster::Grid::capture(state.terminal.as_ref().unwrap())?;
+                    let grid=crate::raster::Grid::capture(state.terminal()?)?;
                     if last_grid.as_ref()!=Some(&grid) {
+                        // A cancelled spawn_blocking job keeps its permit until
+                        // encoding finishes. Selection changes cannot queue more.
+                        let Some(permit) = options.image_jobs.as_ref().and_then(|jobs| jobs.clone().try_acquire_owned().ok()) else { continue; };
                         last_grid=Some(grid.clone());
                         let encode_options=options.clone();
-                        let image=tokio::task::spawn_blocking(move||encode_options.encode(&grid,width,height,id)).await??;
+                        let image=tokio::task::spawn_blocking(move|| { let _permit = permit; encode_options.encode(&grid,width,height,id) }).await??;
                         tx.send_replace(Frame {text,image:Some(Arc::new(image))});
                     }
                 } else if tx.borrow().text != text { tx.send_replace(Frame::text(text)); }
                 dirty = false;
             }
-            value = protocol::next_json(&mut control.socket) => { value?; },
+            value = control.next_event() => { value?; },
         }
     }
 }

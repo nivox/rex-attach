@@ -1,4 +1,5 @@
 {
+  "preview_layout": "row",
   "shortcuts": {
     "browser": {
       "up": "client.browser.up",
@@ -16,6 +17,7 @@
       "c": "client.create",
       "x": "client.close",
       "r": "client.rename",
+      "p": "client.browser.toggle_preview",
       "ctrl+r": "session.refresh",
       "?": "client.shortcuts"
     },

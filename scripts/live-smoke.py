@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Exercise interactive attachment in a disposable session; requires Rex and a PTY."""
+from smoke_support import api_client, open_terminal, controlling_terminal
 import argparse
 import fcntl
-import json
 import os
-import pty
 import re
 import select
 import struct
@@ -90,15 +89,12 @@ def main():
     parser.add_argument("--exit-key", choices=["ctrl-c", "esc"], default="ctrl-c")
     parser.add_argument("--multi-block-tab", action="store_true")
     parser.add_argument("--preview-mode", choices=["auto", "text", "kitty"], default="text")
+    parser.add_argument("--preview-layout", choices=["column", "row"], default="column")
     parser.add_argument("--preview-font")
     parser.add_argument("--kitty-terminal", action="store_true")
     parser.add_argument("--image-out")
     args = parser.parse_args()
-    rex = ["rex", "--autostart=false", "--server", args.socket]
-
-    def api(method, payload):
-        return json.loads(subprocess.check_output(
-            rex + ["api", "call", method, json.dumps(payload)], timeout=15))
+    api = api_client(args.socket)
 
     label = "smoke-" + uuid.uuid4().hex[:6]
     def shell():
@@ -125,20 +121,15 @@ def main():
                    "--session", session, "--block", block]
         interactive_command = [args.binary, "--socket", args.socket]
         interactive_command += ["--preview", args.preview_mode]
+        interactive_command += ["--preview-layout", args.preview_layout]
         if args.preview_font:
             interactive_command += ["--preview-font", args.preview_font]
         if args.mode in ("session", "direct"):
             interactive_command += ["--session", session]
         if args.mode == "direct":
             interactive_command += ["--block", block]
-        master, slave = pty.openpty()
-        before = termios.tcgetattr(slave)
-        before_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        master, slave, before, before_flags = open_terminal(120, 40)
 
-        def controlling_terminal():
-            os.setsid()
-            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
         process = subprocess.Popen(interactive_command, stdin=slave, stdout=slave, stderr=slave,
                                    preexec_fn=controlling_terminal,
@@ -152,8 +143,9 @@ def main():
         navigated = False
         preview_seen = False
         preview_seeded = False
+        preview_toggle = 0
         saw_blocks_column = False
-        returned_to_picker = False
+        returned_to_browser = False
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if select.select([master], [], [], 0.05)[0]:
@@ -167,7 +159,7 @@ def main():
             text = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", output)
             compact = re.sub(rb"\s+", b"", text)
             saw_blocks_column |= b"Blocks" in compact
-            if not picked and not navigated and b"Detachfromablockwith" in compact:
+            if not picked and not navigated and b"Detachfromablockwith" in compact and label.encode() in text:
                 keys = b""
                 if args.mode == "all":
                     sessions = api("session.list", {})["sessions"]
@@ -182,13 +174,23 @@ def main():
                 continue
             ready = len(graphics.frames) > 0 if args.kitty_terminal else b"REX_PREVIEW_READY" in text
             updated = len(graphics.frames) > seed_frames if args.kitty_terminal else b"REX_PREVIEW_UPDATED" in text
-            if not picked and navigated and ((not preview_seeded and ready) or (preview_seeded and updated)):
+            if preview_toggle == 1:
+                if {frame[0] for frame in graphics.frames}.issubset(graphics.deleted):
+                    os.write(master, b"p")
+                    seed_frames = len(graphics.frames)
+                    preview_toggle = 2
+                continue
+            if not picked and navigated and (not args.multi_block_tab or saw_blocks_column) and ((not preview_seeded and ready) or (preview_seeded and updated)):
                 if not preview_seeded:
                     assert owner() == before_owner, "preview claimed block ownership"
                     api("com.superlogical.terminal.write", {"session_id": session, "block_id": block, "args": {"data": "printf '%s%s\\n' REX_PREVIEW_ UPDATED\r"}})
                     preview_seeded = True
                     seed_frames = len(graphics.frames)
                     output.clear()
+                    continue
+                if args.kitty_terminal and preview_toggle == 0:
+                    os.write(master, b"p")
+                    preview_toggle = 1
                     continue
                 preview_seen = True
                 assert api("com.superlogical.terminal.size", {"session_id": session, "block_id": block}) == before_size, "preview changed terminal size"
@@ -207,17 +209,17 @@ def main():
                 sent_detach = True
                 output.clear()
                 continue
-            if sent_detach and not returned_to_picker and b"DetachfromablockwithCtrl-Bd" in compact:
+            if sent_detach and not returned_to_browser and b"DetachfromablockwithCtrl-Bd" in compact:
                 assert b"Blockinformation" in compact, "browser did not restore block information"
                 assert (b"Blocks" in compact) == args.multi_block_tab, "browser did not restore block column"
-                returned_to_picker = True
+                returned_to_browser = True
                 os.write(master, b"\x03" if args.exit_key == "ctrl-c" else b"\x1b")
             if process.poll() is not None:
                 break
         assert process.poll() == 0, f"interactive client failed or stalled: {process.poll()}, tail={output[-500:]!r}"
         assert sent_detach, "input marker never rendered"
         assert args.mode == "direct" or preview_seen, "selected block was not previewed"
-        assert returned_to_picker, "detaching did not return to picker"
+        assert returned_to_browser, "detaching did not return to browser"
         while select.select([master], [], [], 0.05)[0]:
             graphics.feed(os.read(master, 4096))
         if args.kitty_terminal:
@@ -232,7 +234,7 @@ def main():
         assert fcntl.fcntl(slave, fcntl.F_GETFL) == before_flags, "terminal descriptor flags changed"
         capture = subprocess.check_output(command + ["--capture"], timeout=15)
         assert b"REX_ATTACH_INPUT_OK" in capture, "block did not survive detach"
-        print(f"PASS ({args.mode}, {args.exit_key}): selection, redraw, input, detach to picker, exit, terminal restoration, surviving block")
+        print(f"PASS ({args.mode}, {args.exit_key}): selection, redraw, input, detach to browser, exit, terminal restoration, surviving block")
     finally:
         if process is not None and process.poll() is None:
             process.kill()
@@ -240,7 +242,7 @@ def main():
         for fd in (master, slave):
             if fd is not None:
                 os.close(fd)
-        subprocess.run(rex + ["kill", session], check=True, timeout=15)
+        api("session.destroy", {"session_id": session})
 
 
 if __name__ == "__main__":

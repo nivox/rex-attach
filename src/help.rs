@@ -1,6 +1,7 @@
 //! Shortcut help displays the effective map rather than a copy of the defaults.
 use crate::{
-    Target, protocol,
+    domain::Target,
+    protocol,
     shortcuts::{Bindings, Event, Matcher},
     stream, terminal, tty,
 };
@@ -31,8 +32,8 @@ impl Help {
     /// Help is modal: navigation/close only, with no application actions or input.
     pub fn feed(&mut self, event: Event, count: usize) -> bool {
         let (action, bytes) = match event {
-            Event::Action(a, b) => (a, b),
-            Event::Raw(b) => (String::new(), b),
+            Event::Action(a, b) => (Some(a), b),
+            Event::Raw(b) => (None, b),
         };
         if bytes == b"\x1b[200~" {
             self.pasting = true;
@@ -45,7 +46,7 @@ impl Help {
         if self.pasting {
             return false;
         }
-        if action == "client.shortcuts" {
+        if action == Some(crate::action::Action::ClientShortcuts) {
             return true;
         }
         match bytes.as_slice() {
@@ -97,7 +98,11 @@ impl Help {
                     ),
                 )
                 .chain(bindings.display.iter().map(|(key, action)| {
-                    Row::new([key.clone(), description(action).into(), action.clone()])
+                    Row::new([
+                        key.clone(),
+                        action.description().into(),
+                        action.as_str().into(),
+                    ])
                 }))
             })
             .skip(offset);
@@ -130,38 +135,6 @@ impl Help {
         );
     }
 }
-fn description(action: &str) -> &str {
-    match action {
-        "client.shortcuts" => "Show shortcut help",
-        "client.create" => "Create focused kind",
-        "client.rename" => "Rename focused entry",
-        "client.close" => "Close focused entry (confirm)",
-        "client.browser.up" => "Previous entry",
-        "client.browser.down" => "Next entry",
-        "client.browser.left" => "Parent column",
-        "client.browser.right" => "Child column",
-        "client.browser.choose" => "Choose / attach",
-        "client.browser.exit" => "Exit browser",
-        "session.refresh" => "Refresh browser",
-        "session.new" => "Create session",
-        "session.rename" => "Rename session",
-        "session.close" => "Close session (confirm)",
-        "client.tab.new" => "Create tab",
-        "client.tab.rename" => "Rename tab",
-        "client.tab.close" => "Close tab (confirm)",
-        "client.tab.next" => "Attach next tab",
-        "client.tab.previous" => "Attach previous tab",
-        "pane.split" | "pane.split.right" => "Split side by side",
-        "pane.split.down" => "Split above / below",
-        "pane.focus_next" => "Attach next block",
-        "pane.rename" => "Rename block",
-        "pane.close" => "Close block (confirm)",
-        "client.detach" => "Return to browser",
-        "client.send_prefix" => "Send literal Ctrl-B",
-        _ => action,
-    }
-}
-
 /// Keep consuming the live stream while help covers the attached terminal.
 /// Returns false if the program should exit, true when help was dismissed.
 pub async fn show_terminal(
@@ -192,8 +165,8 @@ pub async fn show_terminal(
             result=input.read(&mut bytes)=>{let n=result?;if n==0{return Ok(false);}let events=keys.feed(&bytes[..n]);deadline=keys.waiting().then(||tokio::time::Instant::now()+keys.delay());events},
             _=tokio::time::sleep_until(deadline.unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(3600))),if deadline.is_some()=>{deadline=None;keys.timeout()},
             result=stream::next_binary(data)=>{state.feed(&result?)?;vec![]},
-            value=protocol::next_json(&mut control.socket)=>{value?;vec![]},
-            _=winch.recv()=>{crate::resize(target,control,tty::size()?).await?;dirty=true;vec![]},
+            value=control.next_event()=>{value?;vec![]},
+            _=winch.recv()=>{crate::session::resize(target,control,tty::size()?).await?;dirty=true;vec![]},
             _=interrupt.recv()=>return Ok(false),_=terminate.recv()=>return Ok(false),
         };
         for event in events {

@@ -7,12 +7,25 @@ use ghostty_vt::{
 use serde_json::Value;
 
 pub struct State {
-    pub terminal: Option<Terminal>,
+    terminal: Option<Terminal>,
     snapshot: SnapshotBuffer,
     parser: ApcParser,
     held_since: Option<std::time::Instant>,
 }
 impl State {
+    pub fn is_ready(&self) -> bool {
+        self.terminal.is_some()
+    }
+    pub fn terminal(&self) -> Result<&Terminal> {
+        self.terminal
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("terminal snapshot is not ready"))
+    }
+    pub fn terminal_mut(&mut self) -> Result<&mut Terminal> {
+        self.terminal
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("terminal snapshot is not ready"))
+    }
     pub fn new(nonce: u64) -> Self {
         Self {
             terminal: None,
@@ -73,7 +86,7 @@ impl State {
 // Text capture remains stateless; interactive output reuses Renderer below.
 pub fn frame(terminal: &mut Terminal, width: u16, height: u16, ansi: bool) -> Result<String> {
     if ansi {
-        return Renderer::new()?.frame(terminal, width, height);
+        return Renderer::new(Backend::Ansi)?.frame(terminal, width, height);
     }
     let mut state = RenderState::new()?;
     let snapshot = state.update(terminal)?;
@@ -87,174 +100,69 @@ pub fn frame(terminal: &mut Terminal, width: u16, height: u16, ansi: bool) -> Re
         if y >= height {
             break;
         }
-        let mut cells = cells.update(row)?;
-        let mut x = 0;
-        while let Some(cell) = cells.next() {
-            if x >= width {
-                break;
-            }
-            x += 1;
-            if cell.raw_cell()?.wide()? == ghostty_vt::screen::CellWide::SpacerTail {
-                continue;
-            }
-            text.clear();
-            cell.graphemes_utf8(&mut text)?;
-            if text.is_empty() || cell.style()?.invisible {
-                out.push(' ');
-            } else {
-                out.extend(text.chars().filter(|c| !c.is_control()));
-            }
-        }
+        text_row(row, &mut cells, &mut text, &mut out, width)?;
         out.push('\n');
         y += 1;
     }
     Ok(out)
 }
 
-pub struct Renderer {
-    state: RenderState,
-    rows: RowIterator,
-    cells: CellIterator,
-    lines: Vec<String>,
-    dimensions: Option<(u16, u16, u16, u16)>,
-    background: Option<ghostty_vt::style::RgbColor>,
-    cursor: Option<Option<(u16, u16)>>,
-    scratch: String,
-    text: String,
+fn text_row(
+    row: &ghostty_vt::render::RowIteration<'_>,
+    cells: &mut CellIterator,
+    text: &mut String,
+    out: &mut String,
+    width: u16,
+) -> Result<()> {
+    let mut cells = cells.update(row)?;
+    let mut x = 0;
+    while let Some(cell) = cells.next() {
+        if x >= width {
+            break;
+        }
+        x += 1;
+        if cell.raw_cell()?.wide()? == ghostty_vt::screen::CellWide::SpacerTail {
+            continue;
+        }
+        text.clear();
+        cell.graphemes_utf8(text)?;
+        if text.is_empty() || cell.style()?.invisible {
+            out.push(' ');
+        } else {
+            out.extend(text.chars().filter(|c| !c.is_control()));
+        }
+    }
+    Ok(())
+}
+
+mod ansi;
+mod ratatui_backend;
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub enum Backend {
+    #[default]
+    Ansi,
+    Ratatui,
+}
+
+pub enum Renderer {
+    Ansi(ansi::Renderer),
+    Ratatui(ratatui_backend::Renderer),
 }
 
 impl Renderer {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            state: RenderState::new()?,
-            rows: RowIterator::new()?,
-            cells: CellIterator::new()?,
-            lines: Vec::new(),
-            dimensions: None,
-            background: None,
-            cursor: None,
-            scratch: String::new(),
-            text: String::new(),
-        })
+    pub fn new(backend: Backend) -> Result<Self> {
+        match backend {
+            Backend::Ansi => Ok(Self::Ansi(ansi::Renderer::new()?)),
+            Backend::Ratatui => Ok(Self::Ratatui(ratatui_backend::Renderer::new()?)),
+        }
     }
 
     pub fn frame(&mut self, terminal: &Terminal, width: u16, height: u16) -> Result<String> {
-        use ghostty_vt::{render::Dirty, screen::CellWide};
-        use std::fmt::Write;
-        let snapshot = self.state.update(terminal)?;
-        let dimensions = (width, height, snapshot.cols()?, snapshot.rows()?);
-        let defaults = snapshot.colors()?;
-        // A background change must also repaint padding outside the block.
-        let reset =
-            self.dimensions != Some(dimensions) || self.background != Some(defaults.background);
-        let all = reset || snapshot.dirty()? == Dirty::Full;
-        let cursor = if snapshot.cursor_visible()? {
-            snapshot
-                .cursor_viewport()?
-                .filter(|p| p.x < width && p.y < height)
-                .map(|p| (p.x, p.y))
-        } else {
-            None
-        };
-        let mut body = String::new();
-        if reset {
-            self.lines.clear();
-            write!(
-                body,
-                "\x1b[0;38;2;{};{};{};48;2;{};{};{}m\x1b[2J",
-                defaults.foreground.r,
-                defaults.foreground.g,
-                defaults.foreground.b,
-                defaults.background.r,
-                defaults.background.g,
-                defaults.background.b
-            )?;
+        match self {
+            Self::Ansi(renderer) => renderer.frame(terminal, width, height),
+            Self::Ratatui(renderer) => renderer.frame(terminal, width, height),
         }
-        self.lines
-            .resize_with(usize::from(snapshot.rows()?.min(height)), String::new);
-        let mut rows = self.rows.update(&snapshot)?;
-        let mut y = 0;
-        while let Some(row) = rows.next() {
-            if y >= height {
-                break;
-            }
-            let index = usize::from(y);
-            y += 1;
-            if !all && !row.dirty()? {
-                continue;
-            }
-            self.scratch.clear();
-            let mut active_style = None;
-            let mut cells = self.cells.update(row)?;
-            let mut x = 0;
-            while let Some(cell) = cells.next() {
-                if x >= width {
-                    break;
-                }
-                let at = x;
-                x += 1;
-                let wide = cell.raw_cell()?.wide()?;
-                if wide == CellWide::SpacerTail {
-                    continue;
-                }
-                let style = cell.style()?;
-                let mut fg = cell.fg_color()?.unwrap_or(defaults.foreground);
-                let mut bg = cell.bg_color()?.unwrap_or(defaults.background);
-                if style.inverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                let key = (fg, bg, style.bold, style.italic);
-                if active_style != Some(key) {
-                    write!(
-                        self.scratch,
-                        "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
-                        fg.r, fg.g, fg.b, bg.r, bg.g, bg.b
-                    )?;
-                    if style.bold {
-                        self.scratch.push_str("\x1b[1m");
-                    }
-                    if style.italic {
-                        self.scratch.push_str("\x1b[3m");
-                    }
-                    active_style = Some(key);
-                }
-                self.text.clear();
-                cell.graphemes_utf8(&mut self.text)?;
-                if wide == CellWide::SpacerHead || (wide == CellWide::Wide && at + 1 >= width) {
-                    self.scratch.push(' ');
-                } else if self.text.is_empty() || style.invisible {
-                    self.scratch.push(' ');
-                    if wide == CellWide::Wide {
-                        self.scratch.push(' ');
-                    }
-                } else {
-                    self.scratch
-                        .extend(self.text.chars().filter(|c| !c.is_control()));
-                }
-            }
-            if reset || self.lines[index] != self.scratch {
-                write!(body, "\x1b[{};1H{}", index + 1, self.scratch)?;
-                std::mem::swap(&mut self.lines[index], &mut self.scratch);
-            }
-        }
-        snapshot.clean()?;
-        self.dimensions = Some(dimensions);
-        self.background = Some(defaults.background);
-        if body.is_empty() && self.cursor == Some(cursor) {
-            return Ok(String::new());
-        }
-        let mut out = String::with_capacity(body.len() + 64);
-        // Synchronized output is ignored by terminals that do not support it.
-        // On supporting terminals it presents each batch atomically.
-        out.push_str("\x1b[?2026h\x1b[?25l");
-        out.push_str(&body);
-        out.push_str("\x1b[0m");
-        if let Some((x, y)) = cursor {
-            write!(out, "\x1b[{};{}H\x1b[?25h", y + 1, x + 1)?;
-        }
-        out.push_str("\x1b[?2026l");
-        self.cursor = Some(cursor);
-        Ok(out)
     }
 }
 
@@ -311,6 +219,7 @@ impl ApcParser {
 
 #[cfg(test)]
 mod tests {
+    use super::ratatui_backend::Renderer;
     use super::*;
     use ghostty_vt::{TerminalOptions, snapshot};
 
@@ -354,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn single_cell_updates_only_emit_one_row_and_resize_invalidates_cache() -> Result<()> {
+    fn single_cell_updates_only_emit_changed_cell_and_resize_invalidates_cache() -> Result<()> {
         let mut source = Terminal::new(TerminalOptions {
             cols: 120,
             rows: 40,
@@ -366,13 +275,86 @@ mod tests {
         source.vt_write(b"\x1b[20;60Hx");
         let delta = renderer.frame(&source, 120, 40)?;
         assert!(delta.len() < 256, "{} bytes", delta.len());
-        assert!(delta.contains("\x1b[20;1H"));
+        assert!(delta.contains("\x1b[20;60H"));
         assert!(!delta.contains("\x1b[2J"));
         source.vt_write(b"\x1b[10;10H");
         let cursor = renderer.frame(&source, 120, 40)?;
         assert!(cursor.len() < 64);
         assert!(!cursor.contains("38;2"));
         assert!(renderer.frame(&source, 80, 24)?.contains("\x1b[2J"));
+        Ok(())
+    }
+
+    #[test]
+    fn ratatui_output_matches_original_renderer_for_wide_cells_and_theme_changes() -> Result<()> {
+        let options = || TerminalOptions {
+            cols: 12,
+            rows: 3,
+            ..Default::default()
+        };
+        let mut source = Terminal::new(options())?;
+        let mut display = Terminal::new(options())?;
+        source.vt_write(b"\x1b[?7l");
+        display.vt_write(b"\x1b[?7l");
+        let mut renderer = Renderer::new()?;
+        let updates: &[&[u8]] = &[
+            "界😀 e\u{301}".as_bytes(),
+            b"\x1b[1;1Habcd", // Replace both halves of wide glyphs.
+            "\x1b[1;2H界".as_bytes(),
+            "\x1b[2;1H\x1b[8m界\x1b[0m".as_bytes(),
+            b"\x1b[2;1H\x1b[1;3;7;31;44mstyle\x1b[0m",
+            "\x1b[3;12H界".as_bytes(), // Clipped wide glyph at the right edge.
+            b"\x1b]11;rgb:12/34/56\x1b\\",
+            b"\x1b]10;rgb:fe/dc/ba\x1b\\",
+            b"\x1b[2J\x1b[H\x1b[?25l",
+        ];
+        for update in updates {
+            source.vt_write(update);
+            display.vt_write(renderer.frame(&source, 12, 3)?.as_bytes());
+            let expected = ansi::Renderer::new()?.frame(&source, 12, 3)?;
+            let actual = ansi::Renderer::new()?.frame(&display, 12, 3)?;
+            // The outer terminal keeps its own theme. Compare visible cell colors
+            // and cursor state, excluding the oracle's initial clear/default SGR.
+            assert_eq!(
+                expected.split_once("\x1b[1;1H").unwrap().1,
+                actual.split_once("\x1b[1;1H").unwrap().1,
+                "update {update:?}"
+            );
+            assert!(renderer.frame(&source, 12, 3)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ratatui_clears_padding_after_source_resize_and_background_change() -> Result<()> {
+        let options = || TerminalOptions {
+            cols: 20,
+            rows: 4,
+            ..Default::default()
+        };
+        let mut source = Terminal::new(options())?;
+        let mut expected = Terminal::new(options())?;
+        let mut actual = Terminal::new(options())?;
+        expected.vt_write(b"\x1b[?7l");
+        actual.vt_write(b"\x1b[?7l");
+        let mut legacy = ansi::Renderer::new()?;
+        let mut renderer = Renderer::new()?;
+        for (cols, rows, update) in [
+            (20, 4, &b"\x1b[4;1Hbottom row"[..]),
+            (8, 2, &b"\x1b[2J\x1b[Hsmall"[..]),
+            (8, 2, &b"\x1b]11;rgb:12/34/56\x1b\\"[..]),
+            (20, 4, &b"\x1b[4;1Hlarge again"[..]),
+        ] {
+            source.resize(cols, rows, 0, 0)?;
+            source.vt_write(update);
+            expected.vt_write(legacy.frame(&source, 20, 4)?.as_bytes());
+            actual.vt_write(renderer.frame(&source, 20, 4)?.as_bytes());
+            assert_eq!(
+                ansi::Renderer::new()?.frame(&expected, 20, 4)?,
+                ansi::Renderer::new()?.frame(&actual, 20, 4)?,
+                "source {cols}x{rows}, update {update:?}"
+            );
+        }
         Ok(())
     }
 
@@ -401,7 +383,7 @@ mod tests {
         for row in 1..=40 {
             terminal.vt_write(format!("\x1b[{row};1H{}", "x".repeat(119)).as_bytes());
         }
-        let mut renderer = Renderer::new()?;
+        let mut renderer = ansi::Renderer::new()?;
         let first = renderer.frame(&terminal, 120, 40)?.len();
         let start = std::time::Instant::now();
         let mut total = 0;
@@ -527,3 +509,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod benchmark;

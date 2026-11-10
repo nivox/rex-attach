@@ -1,0 +1,21 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Check formatting
+        run: nix develop --command cargo fmt --all -- --check
+      - name: Test
+        run: nix develop --command cargo test --locked
+      - name: Lint all targets
+        run: nix develop --command cargo clippy --locked --all-targets -- -D warnings
+      - name: Test rasterized preview with explicit font
+        run: nix develop --command cargo test --locked rasterized_preview -- --ignored

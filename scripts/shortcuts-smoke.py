@@ -1,64 +1,49 @@
 #!/usr/bin/env python3
 """Exercise browser CRUD and terminal shortcuts in disposable Rex sessions."""
+from smoke_support import Screen, api_client, open_terminal, controlling_terminal, wait_until
 import argparse
 import fcntl
 import json
 import os
-import pty
 import select
-import struct
 import subprocess
 import tempfile
 import termios
 import time
 import uuid
-import importlib.util
-_spec = importlib.util.spec_from_file_location("activity_smoke", os.path.join(os.path.dirname(__file__), "activity-smoke.py"))
-_module = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_module)
-Screen = _module.Screen
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--socket', required=True)
     parser.add_argument('--binary', default='target/debug/rex-attach')
+    parser.add_argument('--preview-layout', choices=['column', 'row'])
     args = parser.parse_args()
-    rex = ['rex', '--autostart=false', '--server', args.socket, 'api', 'call']
-    def api(method, payload):
-        return json.loads(subprocess.check_output(rex+[method, json.dumps(payload)], timeout=15))
+    api = api_client(args.socket)
     def layout(label):
         return {'block': {'flavor': 'com.superlogical.terminal.shell', 'label': label}}
     label = 'shortcuts-'+uuid.uuid4().hex[:6]
     created = api('session.create', {'label': label, 'initial_windows': [{'window_label': 'first', 'layout': layout('alpha')}]})
     session = created['session_id']
     extra_sessions = []
-    master, slave = pty.openpty()
-    before = termios.tcgetattr(slave)
-    flags = fcntl.fcntl(slave, fcntl.F_GETFL)
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
+    master, slave, before, flags = open_terminal(120, 40)
     process = None
     try:
         with tempfile.TemporaryDirectory(prefix='rex-attach-config-') as config:
             os.mkdir(config+'/rex-attach')
             # Verify that the program actually loads overrides from XDG_CONFIG_DIR.
             with open(config+'/rex-attach/config.json', 'w') as f:
-                json.dump({'shortcuts': {'browser': {'z': 'client.rename'}, 'terminal': {'ctrl+b>q': 'client.detach'}}}, f)
-            def setup():
-                os.setsid()
-                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-            process = subprocess.Popen([args.binary, '--socket', args.socket, '--session', session, '--preview', 'text'], stdin=slave, stdout=slave, stderr=slave, preexec_fn=setup, env={**os.environ, 'TERM': 'xterm-256color', 'XDG_CONFIG_DIR': config})
+                json.dump({'preview_layout': 'row', 'shortcuts': {'browser': {'z': 'client.rename'}, 'terminal': {'ctrl+b>q': 'client.detach'}}}, f)
+            command = [args.binary, '--socket', args.socket, '--session', session, '--preview', 'text']
+            if args.preview_layout:
+                command += ['--preview-layout', args.preview_layout]
+            process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_terminal, env={**os.environ, 'TERM': 'xterm-256color', 'XDG_CONFIG_DIR': config})
             screen = Screen()
             def drain():
                 while select.select([master], [], [], .02)[0]:
                     screen.feed(os.read(master, 65536))
                 assert process.poll() is None, '\n'.join(screen.lines())
             def wait(test, message):
-                deadline = time.monotonic()+12
-                while time.monotonic() < deadline:
-                    drain()
-                    if test(): return
-                raise AssertionError(message+'\n'+'\n'.join(screen.lines()))
+                wait_until(test, lambda: message+'\n'+'\n'.join(screen.lines()), drain)
             def visible(text): return text in '\n'.join(screen.lines())
             def send(data): os.write(master, data)
             def view(): return api('session.view', {'session_id': session})
@@ -69,6 +54,13 @@ def main():
                 send(b'\x15'+text.encode()+b'\r')
                 wait(lambda:not visible(title),'dialog closes')
             wait(lambda:visible('Tabs') and visible('alpha'),'initial browser')
+            wait(lambda:visible('Block information') and visible('Preview (text)'), 'row layout details')
+            shared_row = any('Block information' in line and 'Preview (text)' in line for line in screen.lines())
+            assert shared_row == (args.preview_layout != 'column'), 'config or CLI layout was not applied'
+            send(b'p')
+            wait(lambda:not visible('Block information') and not visible('Preview (text)'), 'hide details')
+            send(b'p')
+            wait(lambda:visible('Block information') and visible('Preview (text)'), 'restore details')
             send(b'?')
             wait(lambda:visible('Shortcut help') and visible('Browser') and visible('client.rename'), 'browser shortcut help')
             assert visible('z')  # configured override is listed
@@ -84,6 +76,8 @@ def main():
             wait(lambda:visible('second'),'created tab selection')
             assert len(view()['windows'])==2
             second = view()['windows'][1]['window_id']
+            send(b'p')
+            wait(lambda:not visible('Block information') and not visible('Preview (text)'), 'hide before attachment')
             send(b'\r')
             # A marker ensures attachment and input are ready, and remains in the
             # remote terminal so navigation can prove which stream is displayed.
@@ -124,6 +118,9 @@ def main():
             wait(lambda:visible('FIRST_MARKER'),'next tab wraps to first')
             send(b'\x02q')  # overridden detach binding
             wait(lambda:visible('Detach from a block with') and visible('Tabs'),'custom detach returns browser')
+            assert not visible('Block information') and not visible('Preview (text)'), 'hidden details should stay hidden after detach'
+            send(b'p')
+            wait(lambda:visible('Block information') and visible('Preview (text)'), 'show details after detach')
             send(b'jlj')  # second window, blocks column, second block
             wait(lambda:visible('Blocks'),'block column')
             edit(b'r','Rename block','renamed-block')
@@ -162,7 +159,7 @@ def main():
             assert process.returncode==0
             assert termios.tcgetattr(slave)==before
             assert fcntl.fcntl(slave,fcntl.F_GETFL)==flags
-            print('PASS: configured browser/terminal help and live restoration; config overrides; session/tab/block CRUD and confirmations; terminal split/new/next/previous/wrap/detach; terminal cleanup')
+            print('PASS: preview layout, hide/show and visibility after detach; configured browser/terminal help and live restoration; config overrides; session/tab/block CRUD and confirmations; terminal split/new/next/previous/wrap/detach; terminal cleanup')
     finally:
         if process is not None and process.poll() is None: process.kill();process.wait()
         os.close(master);os.close(slave)

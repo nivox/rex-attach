@@ -1,275 +1,327 @@
-# rex-attach design proposal
+# Design
 
-Research date: 2026-11-09. This is a proposal, not a working prototype.
+This document describes the current implementation. User setup and basic usage
+live in [README.md](README.md); review guidelines live in
+[CODE_QUALITY.md](CODE_QUALITY.md).
 
-Implementation update: an initial Rust prototype now exists; see README.md for
-its usage, checks, and limitations. It uses libc terminal handling and Rex's
-terminal.write method for the first input path. The semantic event adapter,
-capability fallbacks, and reconnect behavior below remain proposed work.
-Session-label and block-suffix resolution plus read-only snapshot capture have
-subsequently been verified against the local server using approved socket access.
-An interactive smoke test in a disposable session also verifies rendering under
-output backpressure, input, detach, terminal restoration, and block survival.
+## Scope and compatibility
 
-## Goal and interface
+rex-attach mirrors one terminal block from a local Rex server into a Unix TTY.
+SSH is external: run the client on the machine with access to the server socket.
+The Unix socket is selected by `--socket`, then nonempty `REX_SERVER`, then
+automatic probing of standard local paths. There is no remote transport layer.
+Interactive mode requires terminal stdin/stdout and rejects `TERM=dumb`.
 
-Attach directly to a block on the local Rex server from an interactive terminal:
+The control handshake accepts API revisions 10–11. The client uses its own small
+JSON RPC implementation, not the Rex SDK, and relies on the terminal methods and
+Ghostty snapshot format supported by those server versions. Revision negotiation
+does not establish compatibility with every server or outer terminal. There is no
+general color, attribute, or keyboard capability translation layer.
+
+Target resolution uses `target.resolve` for labels, full IDs, and hexadecimal
+suffixes. Blocks are scoped to the resolved session; ambiguity reports candidates
+rather than choosing a block. Explicit session and block arguments attach
+immediately; both are required for capture. Otherwise the browser supplies the
+target. An optional session scope persists across detach and browser mutations.
+
+## Components and state ownership
+
+The executable runs Tokio's current-thread runtime and a `LocalSet`. Each
+terminal state has one owner; network processing and drawing do not concurrently
+mutate Ghostty. CPU-heavy image work runs separately on blocking workers.
+
+| Component | Responsibility |
+| --- | --- |
+| `app.rs` | CLI, browser/attachment loop, interactive input and rendering |
+| `discovery.rs` | Explicit socket selection, Unix endpoint decoding, bounded local socket discovery |
+| `domain.rs`, `wire.rs` | Shared identities and typed decoding at protocol boundaries |
+| `protocol.rs` | Unix WebSocket connections, revision negotiation, ordered RPCs and events |
+| `session.rs` | Session attachment/cleanup, terminal stream setup, resize and RPC/output coordination |
+| `stream.rs` | Binary data handshake and snapshot boundary detection |
+| `terminal.rs`, `terminal/` | Ghostty state, APC parsing, ANSI and Ratatui renderers, renderer benchmarks |
+| `tty.rs` | Raw mode, alternate screen, terminal dimensions, nonblocking input |
+| `browser/model.rs`, `state.rs`, `dialog.rs` | Browser tree, selection, pure transitions and modal editing |
+| `browser/controller.rs`, `data.rs`, `view.rs` | Effects, asynchronous metadata/mutations, Ratatui presentation |
+| `action.rs`, `actions.rs`, `shortcuts.rs`, `help.rs` | Validated local actions, RPC implementations, key matching and modal help |
+| `activity.rs` | Status subscriptions, metadata inspection and activity aggregation |
+| `preview.rs`, `raster.rs` | Read-only preview streams, capability probing and software rasterization |
+| `task.rs` | Cancellable local workers that own their resources |
+| `text.rs` | Display text sanitization |
+
+Browser state and dialog editing return effects. The controller executes view
+changes or hands RPC work to the data worker; transitions contain no protocol or
+TTY operations. Selection is restored by identity rather than stale list indices.
+Production items precede test-only modules.
+
+Socket discovery runs once before entering terminal mode. Explicit selections
+never fall back; `REX_SERVER` accepts absolute paths or percent-encoded Unix
+addresses, not host labels or network endpoints. Without an explicit selection,
+the client probes the runtime override, XDG runtime directory, Linux effective
+UID runtime directory, XDG/home state fallback, and shared server socket (see
+[README.md](README.md#server-socket)). Paths and symlink aliases are deduplicated.
+Each probe has a two-second deadline covering the WebSocket and Rex handshakes;
+cancelled or rejected probes drop their connections. No session RPCs are sent.
+Exactly one successful connection is retained for application startup; zero or
+multiple successes require `--socket`. The resolved path is reused by subsequent
+workers. The Rex CLI is never invoked and no server is launched by the client,
+though connecting to a systemd socket may activate its service.
+
+## Connections, ordering and cancellation
+
+Control uses a WebSocket over a Unix stream at `/api/control`, with subprotocol
+`rex.control.v1`. Each `Control` has one reader and one outstanding RPC. A call
+reads until its matching response; idle event reads happen only outside calls.
+Connection setup, control HELLO, and RPC responses have ten-second timeouts.
+
+The activity subscriber opts into buffering events received during RPCs. Its
+queue retains at most 1,024 events, each at most 16 KiB; periodic snapshots recover
+from dropped events. Response sequence numbers and per-block cutoffs prevent
+older buffered status events or snapshots from replacing newer state.
+
+The main attachment, browser data worker, activity inspector, and preview use
+separate control connections. The browser data worker permits one operation at a
+time, with capacity-one request/result channels. Refresh requests do not accumulate
+while busy; a mutation attempted while busy returns its dialog for later editing.
+Mutations execute once, followed by a metadata reload.
+
+`session::with_session` attaches, runs an operation, and awaits `session.detach`
+on success or operation failure, preserving both operation and cleanup errors.
+Cancellation can interrupt an uncertain RPC, so connection-owning workers drop
+their dedicated connection instead of reusing it. Browser exit/attachment awaits
+worker shutdown. Normal completion detaches explicitly; cancellation relies on
+connection closure to release subscriptions and ownership. Input and mutations
+are never automatically replayed.
+
+While an attached input/action RPC is pending, `while_streaming` continues to
+consume and draw data output. Even an output error does not abandon that RPC:
+it waits for completion before reporting the error, preserving control ordering.
+
+## Attachment and stream lifecycle
+
+1. Resolve the target and attach to its session. Interactive attachment focuses
+   a placed block, activating its tab; detached blocks have no tab to focus.
+   Capture skips focus changes.
+2. Request `data.connect` for data reference `terminal`, bound to
+   `rex.data.terminal.v1`. Open a separate WebSocket at `/api/data` on the same
+   socket and send binary HELLO with the decoded 16-byte ticket. Validate WELCOME
+   and its nonzero channel nonce; the data handshake has an eight-second timeout.
+3. Buffer the initial `GHOSTSNP` snapshot through its FINISH record, then use the
+   published Ghostty decoder to validate and restore it. WebSocket message
+   boundaries are independent of snapshot boundaries; trailing bytes are retained
+   and parsed immediately. Snapshot buffering is limited to 256 MiB and initial
+   restoration has a 30-second timeout.
+4. Capture prints the restored viewport as plain text and releases the session.
+   Interactive mode calls `session.own_block` with mode `take` after restoration,
+   then submits the outer terminal's columns/rows through
+   `com.superlogical.terminal.resize`.
+5. Feed live VT bytes into Ghostty. The incremental parser extracts only Rex APC
+   records matching the channel nonce, preserves partial prefixes across messages,
+   and limits a metadata record to 1 MiB. Resize metadata is applied in stream
+   order. Live theme metadata and process-exit notices are currently ignored.
+
+The restored snapshot and ordered stream are authoritative. A requested resize
+does not optimistically reflow the local emulator; the server's resize record
+does. SIGWINCH submits new dimensions. Ownership is taken once per attachment,
+without repeatedly reclaiming it from another client. Rex shares the block's size
+across viewers and restores the next claimant's requested size on release.
+The hidden `--take` option remains a compatibility alias for the default behavior.
+
+Preview and capture never focus, claim ownership, resize, or write input. Cleanup
+releases attachment/ownership without closing a user's block or session. Explicit
+confirmed management actions are the only close path. There is no data resume or
+automatic reconnect: attachment failures become browser notices when possible,
+and unrecoverable control/browser errors exit through terminal cleanup.
+
+## Terminal rendering and input
+
+Ghostty supplies emulation state, cells, widths, colors and cursor state. The
+client renders that state rather than copying the original stream to stdout,
+which would expose snapshot framing and transport metadata to the outer terminal.
+Ghostty query replies are not sent back to Rex.
+
+The default ANSI renderer retains Ghostty render state, inspects dirty rows,
+compares rendered row strings, and emits changed rows with style runs. The
+alternative `--renderer ratatui` retains dirty-row tracking and compares Ratatui
+buffers within those rows, using the Crossterm backend to emit changed cells.
+Both preserve wide-cell continuations and grapheme text, invalidate caches on
+source/output dimensions or default-background changes, and repaint padding.
+They batch frames with synchronized output and draw on a 16 ms timer. Remote
+synchronized updates hold rendering until completion, with a one-second timeout.
+The browser uses Ratatui's incremental drawing and synchronized frame output.
+
+ANSI remains the default because the recorded comparison found lower CPU use and
+render latency, despite Ratatui emitting fewer bytes. See the
+[renderer comparison](benchmarks/renderer-comparison.md) for measurements,
+workloads, limitations and reproduction commands. Renderer changes must preserve
+dirty-row processing, cell widths, invalidation and output bounds; compare against
+the second-emulator tests and serial release benchmarks.
+
+One outer `tty::Guard` owns termios, raw mode, the alternate screen and autowrap
+across browser and attachment. Drop ends synchronized output, resets styles,
+restores wrap/cursor/screen and saved termios. Input opens `/dev/tty` independently
+with `O_NONBLOCK` and Tokio readiness; it does not set nonblocking mode on the
+shared stdin/stdout file description. Ratatui does not run a competing input
+reader or terminal setup. Browser/help rendering avoids cursor-position queries.
+
+Input is a byte stream, not semantic `block.event` keyboard events. Unbound input
+and bracketed paste pass through `com.superlogical.terminal.write` as UTF-8;
+partial UTF-8 characters wait for completion and invalid UTF-8 fails. There is no
+application cursor/keypad or terminal keyboard protocol translation. Ctrl-C,
+Ctrl-D and Ctrl-Z typed in raw mode go to the remote program. External SIGINT and
+SIGTERM request exit through the normal cleanup path.
+
+Shortcut matching preserves fragmented escapes, bracketed-paste isolation and
+unmatched bytes. It buffers chord sequences with a one-second prefix timeout
+(and an 80 ms partial-token timeout), recognizing CSI-u and xterm modifyOtherKeys
+without globally enabling an extended keyboard mode. Modified punctuation has
+portable literal aliases. Detach/navigation/help preserve trailing bytes in the
+TTY unread buffer. Terminal navigation computes destinations from this client's
+attached block's tab, wraps, skips tabs without terminals, and restores their
+focused terminal or first terminal. A switch restores a fresh stream.
+
+Help displays effective configured bindings and suspends actions/input forwarding.
+Attached help continues consuming live output and creates a fresh renderer on
+close. Browser help hides Kitty placements while retaining image data for reuse.
+
+## Browser model and activity
+
+The browser maps Rex `session.view.windows` to visible tabs; native application
+windows add no level. Tiled and floating blocks stay under their tab; detached
+blocks form a virtual tab. Single-block tabs skip the blocks column. Empty
+sessions and nonterminal blocks remain visible but cannot be attached.
+Metadata reloads every five seconds or on explicit refresh. Detach restores the
+selected tab/block and original scope; preview visibility persists for the client
+lifetime.
+
+Custom labels take precedence over terminal titles. Default labels are inferred
+from ID-based names and creator/flavor names because Rex exposes no customized
+flag; a custom label identical to a default is indistinguishable. Default tabs
+use their focused block's title; default blocks use their terminal title, falling
+back to stored labels. Rename dialogs and block details use stored labels.
+
+Create/rename/close dialogs capture target identities and edit Unicode labels.
+Blank creation labels request defaults; Ctrl-U clears rename text. Only `y`
+confirms closing; Enter cancels. A new session has one tab/shell, a new tab one
+shell, and block creation splits the anchor. Single-block tabs create another tab
+from the tab column. Scoped session creation reports the new ID without changing
+scope. Action names are validated locally and translated into RPCs rather than
+invoking native application actions.
+
+The information pane includes label/flavor, title, directory, foreground
+process/PID and reported status/progress/messages. Directory prefers terminal pwd,
+then foreground/child process cwd. Missing fields and inspection errors remain
+visible. In column layout, details occupy one equal-width navigation column,
+with information above preview. The default row layout allocates half the body to
+navigation and half to side-by-side information/preview. Hiding details reclaims
+that space.
+
+The independent inspector subscribes to sessions, snapshots all terminal blocks'
+program statuses, follows change/removal events, and resyncs every five seconds.
+Selected title/pwd/process queries run once per second; other titles refresh on
+initial discovery and five-second resync. Watch updates are coalesced to 10 fps.
+Status comes from programs reporting OSC 7501, never inferred from process
+existence or output. Priority within blocks and up through tabs/sessions is
+needs-input (🙋), error (❌), working (🔄), done (✅), idle (💤), unknown.
+Unknown has no visible badge/status row. Clearing reports removes stale messages
+and indicators. Inspection never owns blocks or sends input.
+
+## Preview and bounded image work
+
+Each selection uses a separate read-only snapshot/live stream. Selection changes
+are debounced for 120 ms. The previous worker is stopped on target/size changes;
+images are deleted by their own ID on replacement, hiding or browser exit.
+
+Auto mode probes Kitty support, compression and cell dimensions through the same
+async TTY reader, with a 500 ms deadline that preserves unrelated typed keys.
+Known incompatible Unicode-placement backends (WezTerm and Konsole) use text.
+Text fallback also covers absent graphics or unavailable automatically selected
+fonts. Explicit font errors surface; forced Kitty mode can use assumed cell
+size when probing fails. The protocol supports tmux passthrough, but images still
+require Unicode placements through the entire terminal/multiplexer chain.
+
+Text previews crop to the pane and update at up to 10 fps. Image previews sample
+Ghostty cells, colors, basic styles and cursor at up to 2.5 fps, deduplicate equal
+grids, and fit the captured viewport into the pane with its aspect ratio intact.
+They use `ratatui-image` Kitty Unicode placements, reusing one image ID per stream
+and compression when advertised. RGB colors are required for image addressing,
+so image rendering preserves colors even under `NO_COLOR`.
+
+The rasterizer uses an explicit CLI font, `REX_ATTACH_PREVIEW_FONT`, or a discovered
+monospace font, with glyph fallback. It bounds capture to 240×120 cells, renders
+9×18-pixel cells and clears its glyph cache above 4,096 entries. Rasterization,
+fallback lookup, resizing and encoding run on blocking workers behind one shared
+semaphore permit. A cancelled job retains that permit until it finishes, so rapid
+selection changes cannot accumulate image jobs. This is software rendering with
+no display server/GPU; complex emoji shaping and embedded images are unavailable.
+
+## Configuration and build decisions
+
+Configuration loads once, before terminal setup. The first nonempty base of
+`XDG_CONFIG_DIR`, `XDG_CONFIG_HOME`, or `$HOME/.config` supplies
+`rex-attach/config.json`. Missing files use defaults. Browser and terminal maps
+merge individual overrides independently; null disables a key. Invalid chords or
+unsupported actions fail early. `preview_layout` defaults to row and the CLI
+overrides it. [config.example.json](config.example.json) records the default map;
+`action.rs` defines accepted actions and their contexts.
+
+The repository builds independently of sibling checkouts. Rust 1.96+ and Zig
+0.17.x are required for the default native build; `flake.nix` supplies the Rust/C
+and Zig toolchains, pkg-config, Python and DejaVu Sans Mono for previews/tests.
+Published `ghostty-vt` and `ghostty-vt-sys` 0.8.0 dependencies are pinned in
+Cargo.lock. The native binding downloads checksum-verified Ghostty sources;
+offline builds need those sources and Zig dependencies or a compatible static
+library through pkg-config. No Ghostty source or fonts are vendored. The complete
+snapshot decoder suffices because restoration buffers through FINISH; local
+incremental-decoder or graphics patches are unnecessary. Dependency provenance
+and adapted-code attribution live in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+## Validation
+
+Run the required checks in the Nix shell:
 
 ```sh
-rex-attach --socket /path/to/rex.sock --session SESSION --block BLOCK
+nix develop
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked rasterized_preview -- --ignored
 ```
 
-One motivating case is operating a block after logging into a machine over SSH
-when a full Rex client is unavailable. SSH is external to rex-attach and is not
-part of its interface or connection handling.
+CI runs these same checks. Tests exercise protocol/stream fragmentation and
+corruption, snapshot tails, Unicode and resize, ordered RPC/output handling,
+cleanup/cancellation, pure browser/modal transitions, selection restoration,
+shortcut/paste handling, status ordering and propagation, renderer comparisons
+against another emulator, Kitty transfers/deletion and bounded worker work.
+The explicit-font raster test uses the shell's font or `REX_ATTACH_PREVIEW_FONT`.
+Renderer release benchmarks are separate from normal tests.
 
-The prototype requires an explicit socket and resolves session and block
-arguments through `target.resolve`, accepting labels, full IDs, and hexadecimal
-ID suffixes. Block resolution is scoped to the resolved session; ambiguous
-matches report candidates. Later, add socket discovery compatible with Rex's
-environment and platform defaults. Never silently select the focused block.
+For ownership, protocol ordering, navigation or graphics changes, run relevant
+smoke scenarios when a local Rex server and CLI are available. Scripts create and
+clean up disposable sessions; never use a working user block as a write fixture.
 
-Session and block arguments are optional in interactive mode. Without them, a
-Ratatui column browser lists sessions, tabs (Rex windows), and blocks, with a live
-preview at the right; `--session` scopes it to one session and starts in Tabs.
-Single-block tabs skip the blocks column. Arrows and hjkl navigate; Enter opens
-the next column or attaches to a block/single-block tab. Floating-layer blocks
-remain within their tab; detached blocks get a virtual tab.
-Both arguments are required for `--capture`. Explicit session and block arguments
-start attachment immediately. Detaching returns to the picker in the original
-scope, restoring the selected tab/block. Escape and Ctrl-C exit from the browser.
-Internally a `Window` corresponds to `session.view.windows`; the browser calls
-these Tabs to match Rex.app. Native application windows are client-local UI.
-`c`, `r`, and `x` create, rename, and close the focused kind of object. Modal
-operations capture IDs, preserve Unicode labels, and require explicit `y` to
-confirm close (Enter cancels). Creation starts shell blocks; block creation
-splits the selected anchor. The modal lives above the preview image placement.
-
-`shortcuts.browser` and `shortcuts.terminal` in JSON override default key/action
-maps independently; null unbinds. The path is XDG_CONFIG_DIR/rex-attach/config.json,
-falling back to XDG_CONFIG_HOME and ~/.config. Mac action identifiers are handled
-locally through explicit RPCs; focus-dependent browser actions and detach use
-custom client.* names. Attached actions create splits/windows or compute the next
-terminal from the attached block's window, rather than assuming the server's
-active window matches this client. They focus the destination, release the old
-attachment, restore a fresh stream, and preserve trailing input bytes. The browser
-uses short-lived session attachments around mutations and reports RPC failures.
-
-`client.shortcuts` opens modal help (`?` in the browser, Ctrl-B then ? attached).
-Help uses the effective configuration map, omits disabled bindings, and scrolls
-without executing underlying actions or forwarding input. Attached help keeps
-feeding the terminal state and restores it with a fresh renderer on dismissal.
-The browser hides Kitty placeholder cells while help is displayed, retaining
-image data so the preview can return without a forced retransmission.
-
-The right column is split vertically in half: block information above and live
-preview below. The upper pane displays label, creator/flavor, title, directory,
-foreground process/PID, status/progress, and messages. A separate asynchronous
-inspector subscribes to sessions without owning blocks, snapshots activity for
-all terminal blocks, and follows program-status change/removal events. Periodic
-resync recovers missed events; sequence cutoffs prevent buffered older events
-or snapshots from reverting newer statuses. Selected-block metadata refreshes
-once per second. Background updates are coalesced to 10 fps and subscriptions
-are released before attachment or browser exit.
-
-Block badges propagate to tabs and sessions with priority: blocked, error,
-working, done, idle, unknown. Multiple records inside a block use the same
-priority. Missing reports stay unknown; activity is never inferred from process
-existence or terminal output. Status clearing removes indicators and messages.
-Use emoji indicators (🙋 input, ❌ error, 🔄 working, ✅ done, 💤 idle). Unknown
-or unreported status is retained internally but has no badge or visible status
-row, including on parent entries with no reported descendant activity.
-
-It displays names, short IDs, flavor, and ownership, refreshing metadata every
-five seconds or on request. The preview follows a separate read-only data stream
-with debounced selection changes, and never resizes, claims ownership, or sends
-input. The default preview rasterizes Ghostty cell state with a local monospace
-font, fits the full viewport into the pane, and displays it through
-ratatui-image's Kitty protocol widget. Software rasterization and encoding run
-on blocking workers at up to 2.5 fps, with cached glyphs and state deduplication.
-Capability detection is bounded and uses the existing async input reader,
-preserving typed keys. Text fallback runs at up to 10 fps. Preview images use
-one ID per stream, are deleted on exit or selection changes, and have bounded
-grid/pixel allocations. The rasterizer omits complex emoji shaping and embedded
-graphics. Explicit CLI mode/font overrides support terminals where detection
-or system-font discovery is unavailable.
-Metadata browsing briefly attaches to sessions and detaches without claiming
-blocks. Empty sessions and nonterminal blocks are displayed but not attachable.
-
-Target Linux and macOS hosts and xterm-compatible outer terminals, including
-tmux and screen. “Any terminal” means capability-based degradation: basic
-colors and keys work without truecolor, Kitty keyboard, or graphics support.
-`TERM=dumb` and noninteractive stdin/stdout should produce useful errors.
-
-Use the whole alternate screen for the block, without permanent chrome.
-Ctrl-B followed by d detaches; Ctrl-B followed by Ctrl-B forwards the prefix.
-Configurable chord sequences buffer
-fragmented input, preserve unmatched bytes and bracketed pastes, and time out
-a prefix after one second. They recognize CSI-u and xterm modified keys without
-changing the remote application's keyboard protocol.
-Ctrl-C, Ctrl-D, and Ctrl-Z belong to the remote program. Interactive attachment
-takes ownership of its selected block so its dimensions apply immediately. The
-old `--take` flag is accepted as a hidden compatibility option. Preview and capture
-are read-only and never claim ownership or resize.
-Detach leaves the block and its process running and returns to the picker.
-
-## Verified foundations
-
-The public Rex API documents `session.attach`, `data.connect`, `block.event`,
-`session.own_block`, and `session.disown_block`. Data tickets are single-use,
-expire, and can be bound to `rex.data.terminal.v1`. They open a WebSocket at
-`/api/data`. Attachment is to the session even though we display only one block.
-Apply the attach snapshot before events above its sequence cutoff.
-
-Local source inspection provides additional implementation evidence:
-
-- `../rex-rune/vendor/rexrs/src/protocol.rs`: control is a WebSocket over the
-  Unix stream at `/api/control`, subprotocol `rex.control.v1`; JSON HELLO
-  negotiates an API revision range and client identity.
-- `../rex-rune/src/wire.rs`: binary data HELLO, WELCOME, resume handshake,
-  and Ghostty snapshot boundary handling.
-- `../rex-rune/src/terminal.rs`: snapshot restoration followed by VT bytes
-  and nonce-qualified Rex APC metadata for resize, theme, and process exit.
-- `../rex-rune/vendor/rexrs/src/api/generated/terminal.rs`: terminal resize
-  accepts columns and rows; pixel cell dimensions are optional.
-
-These details describe that local implementation, not a promise for every Rex
-release. The installed binary is preview.13. Live discovery failed because the
-execution sandbox denies Unix socket connections; no live compatibility was
-verified and no sessions were created or changed.
-
-## Architecture
-
-```text
-local terminal input -> input adapter -> ordered control requests -> Rex block
-                                                                    |
-local terminal output <- ANSI renderer <- Ghostty state <- data WebSocket
+```sh
+python3 scripts/live-smoke.py --socket /path/to/rex.sock
+python3 scripts/live-smoke.py --socket /path/to/rex.sock --mode all --multi-block-tab
+python3 scripts/live-smoke.py --socket /path/to/rex.sock --mode session --multi-block-tab --preview-mode auto --kitty-terminal
+python3 scripts/ownership-smoke.py --socket /path/to/rex.sock
+python3 scripts/shortcuts-smoke.py --socket /path/to/rex.sock
+python3 scripts/activity-smoke.py --socket /path/to/rex.sock
 ```
 
-Use Rust with Tokio, a Unix-stream WebSocket transport, serde_json, and
-crossterm for raw mode, terminal events, and portable output commands.
-Use Ratatui for the column browser and keep the direct incremental VT renderer
-for the attached block. The outer terminal guard owns terminal setup across
-both views; the Ratatui backend never competes for keyboard input.
-Evaluate the `rexrs` control SDK and `ghostty-vt` bindings already used by
-rex-rune, pinning exact revisions and retaining required licenses if reusing
-code. Keep this repository independently buildable, without sibling path deps.
-The prototype uses the published `ghostty-vt` 0.8.0 wrapper, pinned in Cargo.lock.
-Its complete snapshot decoder supports our buffered restoration without the
-local copy's incremental-decoder and graphics patches.
+Live smoke covers input/output under backpressure, detach/block survival,
+navigation, preview size/ownership invariants, and terminal restoration.
+`--kitty-terminal` simulates a receiver in a PTY and checks transferred pixels,
+updates and deletion; it is not a real emulator GUI test. `--preview-font` selects
+an explicit font and `--image-out /tmp/preview.png` saves decoded pixels. Ownership
+smoke exercises simultaneous clients and resize/release; shortcut smoke covers
+management, navigation, config overrides and modal help; activity smoke covers
+metadata, status changes/clearing and parent aggregation. These checks provide
+bounded evidence, not a guarantee of arbitrary terminal compatibility.
 
-Keep five modules: control (RPC/events), stream (data framing and metadata),
-terminal (Ghostty ownership), input (outer events to Rex), and render (cells to
-outer terminal). A single state owner applies stream bytes and samples render
-state; no Ghostty object is concurrently mutated by networking and drawing.
-Bound queues and batch output; never discard stream bytes to catch up.
+## Unimplemented capabilities
 
-## Attach and stream lifecycle
-
-1. Connect to the explicit Unix socket and complete the control handshake.
-   Check negotiated revision, server limits, and needed methods.
-2. Attach to the session; confirm the requested block supplies terminal data.
-   Buffer interleaved events and honor the response sequence cutoff.
-3. Take ownership of this block only, and submit the
-   outer terminal's dimensions with `com.superlogical.terminal.resize`.
-   Read-only mode does neither. Ownership governs size, not input authorization.
-4. Request a ticket using `data.connect` for the block's terminal data source,
-   explicitly binding `rex.data.terminal.v1`. Open the data WebSocket over a
-   second connection to the same Unix socket and perform binary HELLO.
-5. Decode the initial `GHOSTSNP` snapshot with Ghostty's decoder. Preserve
-   trailing bytes after FINISH: a WebSocket message boundary is not a snapshot
-   boundary. The first version can wait for FINISH; incremental READY rendering
-   is a later optimization for large histories.
-6. Parse the following byte stream incrementally. Extract only Rex APC records
-   matching the channel nonce from WELCOME; feed remaining VT bytes to Ghostty.
-   Apply resize and theme metadata in stream order. Bound snapshot and metadata
-   allocations and let Ghostty validate snapshot checksums and record ordering.
-7. Render the dirty viewport at a capped rate, respecting synchronized output
-   with a timeout. Continue processing bytes even when skipping redraws.
-
-## Rendering, input, and resizing
-
-Ghostty maintains emulation state; it does not draw this TUI. Traverse its
-render state and emit cursor positioning, SGR attributes, grapheme text, and
-cursor visibility. The prototype retains render state and compares dirty rows,
-groups adjacent cells with the same style, and emits only changed rows. It
-clears on initial attachment, resize, or a changed default background, and batches
-frames with synchronized output at up to 60 fps. Respect
-wide-cell continuations and combining characters. Downgrade unsupported colors
-and attributes and handle the bottom-right cell without accidental scrolling.
-Do not forward the original output stream to stdout: it includes snapshot data
-and protocol metadata and could alter the outer terminal's modes.
-
-Decode outer keyboard events and send `block.event` key events with explicit
-session/block IDs. This bypasses Rex layout key bindings, appropriate for a
-single-block tool. Send paste as a paste event, not as synthetic keystrokes;
-Rex handles encoding for the actual PTY. Add mouse/focus events after keyboard
-support, translating coordinates to the block viewport. Local scrollback mode
-can use Ghostty's history without sending wheel events to the program.
-
-Do not also encode keys into raw PTY writes when sending semantic events.
-Determine which side answers terminal queries before enabling any Ghostty
-PtyWrite callbacks; duplicate device replies from the mirrored emulator would
-be a bug. Never reflect outer terminal query responses into remote input.
-
-On SIGWINCH, coalesce resize requests. Keep Ghostty at the size reported by the
-server stream, rather than optimistically reflowing it. Attachment takes ownership
-once and submits the outer dimensions; it does not repeatedly steal ownership if
-another client subsequently takes it. Rex remembers each client's requested size
-and applies the next claimant's size when we detach. The terminal size is shared,
-so taking ownership changes the viewport other clients see as well.
-
-## Failure and cleanup
-
-For the first spike, disconnect with a useful error and restore the terminal.
-For the complete prototype, retain the data resume token, byte offset, Ghostty
-state, and partial metadata parser. Attempt resume; on rejection obtain a new
-ticket and replace the terminal with a fresh snapshot. Count all stream bytes,
-including snapshot and metadata. Resume control identity separately; reattach
-and reconcile if it cannot be resumed. Do not automatically replay input whose
-delivery is uncertain across a disconnect.
-
-Use an RAII terminal guard and orderly signal handling to restore raw mode,
-alternate screen, cursor, mouse, and keyboard modes. Disown/detach when possible;
-never call block.close or session.destroy as cleanup. A child process exiting
-can leave its final screen visible; a block being closed ends attachment.
-
-## Prototype sequence and acceptance
-
-1. Headless spike: control attach, ticket handshake, snapshot restore, and print
-   a text capture. This establishes the Rex/Ghostty compatibility boundary.
-2. Interactive: raw/alternate screen, full viewport redraw, keys, paste, resize,
-   ownership handling, detach, and terminal restoration.
-3. Robustness: row diffs, reconnect, scrollback, read-only mode, mouse, and
-   capability negotiation. Images, clipboard integration, and Rex layouts are
-   outside the initial scope.
-
-Test fragmented snapshot/APC boundaries, corrupt snapshots, trailing VT bytes,
-Unicode width, ordered input, and rejected resume with fresh restore. Integrate
-against a disposable server/session: existing screen, shell, vim/less, alternate
-screen, resize, detach preserving the process, connection loss, and block close.
-Manually check common outer terminals and tmux. Never use a user's
-working block as the write-test fixture.
-
-The current flake supplies Rust and a C toolchain but no Zig. Once a compatible
-Ghostty revision is selected, package it reproducibly with the exact Zig version
-required by its source, or use a pinned binding build with all inputs fetched by
-Nix. Prefer static Ghostty linkage for distribution; users should not need Zig
-or Nix merely to run the binary. Validate the complete Rust/native link before
-committing to Linux static binaries and macOS release targets.
-
-## Sources
-
-- https://www.superlogical.com/rex/docs/reference/api
-- https://www.superlogical.com/rex/docs/automate/server-api
-- https://github.com/ghostty-org/ghostty/blob/main/include/ghostty/vt.h
-- https://github.com/ghostty-org/ghostty/blob/main/include/ghostty/vt/snapshot.h
-- https://github.com/ghostty-org/ghostty/blob/main/PACKAGING-LIBGHOSTTY.md
-- Local rex-rune sources listed above (read-only inspection).
-
-Open implementation questions: live revision compatibility; snapshot decoder
-compatibility with the installed server; exact key-event schema on that revision;
-query-response ownership; login-server authentication for the chosen socket;
-and whether upstream Rust dependencies include the local fixes we need. Start
-with an already authorized per-account Rex server socket; local attachment
-requires permission to access that account's socket.
+Automatic reconnect/data resume, semantic keyboard/paste events, mouse/focus
+forwarding, a local scrollback UI, embedded terminal graphics and clipboard
+integration remain outside the implementation. There is no guarantee of color
+fallback or translation between differing keyboard protocols. Live theme and
+process-exit metadata presentation are also unimplemented.

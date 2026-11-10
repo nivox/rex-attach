@@ -1,29 +1,12 @@
 //! Rex.app action names implemented locally through explicit server methods.
-use crate::{Target, protocol::Control};
+use crate::{
+    action::Action,
+    domain::{Selection, Target},
+    protocol::Control,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
-#[derive(Clone, Debug)]
-pub enum Selection {
-    Session(String),
-    Window { session: String, window: String },
-    Block(Target),
-}
-impl Selection {
-    pub fn session(&self) -> &str {
-        match self {
-            Self::Session(s) | Self::Window { session: s, .. } => s,
-            Self::Block(t) => &t.session,
-        }
-    }
-    pub fn kind(&self) -> &str {
-        match self {
-            Self::Session(_) => "session",
-            Self::Window { .. } => "tab",
-            Self::Block(_) => "block",
-        }
-    }
-}
 pub fn layout(label: &str) -> Value {
     json!({"block":{"flavor":"com.superlogical.terminal.shell","label":label}})
 }
@@ -60,16 +43,10 @@ pub async fn close(control: &mut Control, selection: &Selection) -> Result<()> {
     Ok(())
 }
 async fn scoped(control: &mut Control, session: &str, method: &str, args: Value) -> Result<Value> {
-    control
-        .call("session.attach", json!({"session_id":session}))
-        .await?;
-    let result = control.call(method, args).await;
-    let detached = control
-        .call("session.detach", json!({"session_id":session}))
-        .await;
-    let reply = result?;
-    detached?;
-    Ok(reply)
+    crate::session::with_session(control, session, async |control, _| {
+        control.call(method, args).await
+    })
+    .await
 }
 /// Returns the created session/window/block ID for browser selection restoration.
 pub async fn create(
@@ -126,7 +103,7 @@ fn terminal(block: &Value) -> bool {
             .as_str()
             .is_some_and(|f| f.starts_with("com.superlogical.terminal."))
 }
-fn destination(view: &Value, target: &Target, action: &str) -> Result<String> {
+fn destination(view: &Value, target: &Target, action: Action) -> Result<String> {
     let windows = view["windows"]
         .as_array()
         .context("session has no windows")?;
@@ -176,9 +153,9 @@ fn destination(view: &Value, target: &Target, action: &str) -> Result<String> {
 pub async fn terminal_action(
     control: &mut Control,
     target: &Target,
-    action: &str,
+    action: Action,
 ) -> Result<Target> {
-    let block = match action {
+    let block = match action.as_str() {
         "pane.split" | "pane.split.right" | "pane.split.down" => {
             let direction = if action == "pane.split.down" {
                 "vertical"
@@ -233,13 +210,25 @@ mod tests {
             session: "s".into(),
             block: "b".into(),
         };
-        assert_eq!(destination(&view, &t, "pane.focus_next").unwrap(), "a");
-        assert_eq!(destination(&view, &t, "client.tab.next").unwrap(), "d");
-        assert_eq!(destination(&view, &t, "client.tab.previous").unwrap(), "d");
+        assert_eq!(
+            destination(&view, &t, "pane.focus_next".into()).unwrap(),
+            "a"
+        );
+        assert_eq!(
+            destination(&view, &t, "client.tab.next".into()).unwrap(),
+            "d"
+        );
+        assert_eq!(
+            destination(&view, &t, "client.tab.previous".into()).unwrap(),
+            "d"
+        );
         let t = Target {
             block: "d".into(),
             ..t
         };
-        assert_eq!(destination(&view, &t, "client.tab.next").unwrap(), "b");
+        assert_eq!(
+            destination(&view, &t, "client.tab.next".into()).unwrap(),
+            "b"
+        );
     }
 }

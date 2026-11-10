@@ -1,8 +1,5 @@
 //! Read-only block inspection and program-reported activity for the browser.
-use crate::{
-    Target,
-    protocol::{self, Control},
-};
+use crate::{domain::Target, protocol::Control};
 use anyhow::Result;
 use ratatui::style::Color;
 use serde_json::{Value, json};
@@ -181,60 +178,34 @@ impl Snapshot {
         self.info(target).map_or(State::Unknown, Info::state)
     }
     fn event(&mut self, value: &Value) {
-        if value["type"] != "event" || value["payload"]["type"] != "session_event" {
+        use crate::wire::StatusUpdate;
+        let Some((seq, target, update)) = crate::wire::program_status(value) else {
             return;
-        }
-        let session = &value["payload"]["payload"];
-        if session["event"]["type"] != "block_event" {
-            return;
-        }
-        let event = &session["event"]["payload"];
-        if event["creator_name"] != "com.superlogical.terminal" {
-            return;
-        }
-        let (Some(session_id), Some(block_id)) =
-            (session["session_id"].as_str(), event["block_id"].as_str())
-        else {
-            return;
-        };
-        let target = Target {
-            session: session_id.into(),
-            block: block_id.into(),
         };
         let Some(info) = self.blocks.get_mut(&target) else {
             return;
         };
-        let seq = value["seq"].as_u64().unwrap_or(0);
         if seq <= info.status_seq {
             return;
         }
-        let body = &event["payload"];
-        match event["name"].as_str() {
-            Some("program_status_changed") => {
-                info.records.insert(
-                    body["id"].as_str().unwrap_or("").into(),
-                    Record::parse(&body["record"]),
-                );
+        match update {
+            StatusUpdate::Changed { id, record } => {
+                info.records.insert(id, Record::parse(&record));
                 info.status_seq = seq;
                 info.status_error = None;
             }
-            Some("program_status_removed") => {
-                for id in body["ids"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                {
+            StatusUpdate::Removed { ids } => {
+                for id in ids {
                     if id.is_empty() {
                         info.records.clear();
                     } else {
                         info.records
-                            .retain(|key, _| key != id && !key.starts_with(&format!("{id}/")));
+                            .retain(|key, _| key != &id && !key.starts_with(&format!("{id}/")));
                     }
                 }
                 info.status_seq = seq;
             }
-            _ => {}
+            StatusUpdate::Other => {}
         }
     }
     fn buffered_events(&mut self, control: &mut Control) {
@@ -383,15 +354,18 @@ async fn monitor(
     control.capture_events();
     let mut attached = HashSet::<String>::new();
     let mut snapshot = Snapshot::default();
-    let result = run(
+    let result = tokio::select! {
+        result = run(
         &mut control,
         &mut requests,
         tx,
-        &mut cancelled,
         &mut attached,
         &mut snapshot,
-    )
-    .await;
+    ) => result,
+        // An interrupted RPC cannot be reused. Dropping Control releases all
+        // subscriptions on disconnect, including an uncertain session.attach.
+        _ = &mut cancelled => return Ok(()),
+    };
     for session in attached {
         let _ = control
             .call("session.detach", json!({"session_id":session}))
@@ -403,7 +377,6 @@ async fn run(
     control: &mut Control,
     requests: &mut watch::Receiver<Request>,
     tx: &watch::Sender<Snapshot>,
-    cancelled: &mut oneshot::Receiver<()>,
     attached: &mut HashSet<String>,
     snapshot: &mut Snapshot,
 ) -> Result<()> {
@@ -450,11 +423,10 @@ async fn run(
         }
         tokio::select! {
             _=publish.tick()=> {tx.send_if_modified(|previous|if previous==snapshot{false}else{*previous=snapshot.clone();true});},
-            _=&mut *cancelled=>return Ok(()),
             changed=requests.changed()=> {if changed.is_err(){return Ok(());}reconcile=true;},
             _=refresh.tick()=> {for target in &request.targets {status(control,target,snapshot).await; if request.selected.as_ref() != Some(target) {title(control,target,snapshot).await;}}},
             _=selected_tick.tick()=> {if let Some(target)=&request.selected {details(control,target,snapshot).await;}},
-            event=protocol::next_json(&mut control.socket)=>snapshot.event(&event?),
+            event=control.next_event()=>snapshot.event(&event?),
         }
     }
 }
@@ -586,5 +558,27 @@ mod tests {
         };
         tokio::try_join!(server_task, client_task)?;
         Ok(())
+    }
+    #[test]
+    fn malformed_status_events_do_not_advance_the_sequence_cutoff() {
+        let mut snapshot = Snapshot::default();
+        snapshot.blocks.insert(target(), Info::default());
+        snapshot.event(&event(
+            10,
+            "program_status_changed",
+            json!({"id":"task","record":{"state":"working"}}),
+        ));
+        snapshot.event(&event(
+            20,
+            "program_status_changed",
+            json!({"record":{"state":"error"}}),
+        ));
+        assert_eq!(snapshot.state(&target()), State::Working);
+        snapshot.event(&event(
+            11,
+            "program_status_changed",
+            json!({"id":"task","record":{"state":"done"}}),
+        ));
+        assert_eq!(snapshot.state(&target()), State::Done);
     }
 }

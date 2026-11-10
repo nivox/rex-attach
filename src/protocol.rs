@@ -51,12 +51,16 @@ pub async fn next_json(socket: &mut Socket) -> Result<Value> {
 }
 
 pub struct Control {
-    pub socket: Socket,
+    socket: Socket,
     id: u64,
     events: Option<std::collections::VecDeque<Value>>,
     response_seq: u64,
 }
 impl Control {
+    /// Read idle events only when no RPC is in flight. There is one socket reader.
+    pub async fn next_event(&mut self) -> Result<Value> {
+        next_json(&mut self.socket).await
+    }
     pub async fn resolve_session(&mut self, session: &str) -> Result<String> {
         ensure!(!session.trim().is_empty(), "--session must not be empty");
         let reply = self
@@ -66,8 +70,9 @@ impl Control {
             )
             .await?;
         let target = resolved_target(&reply, "session", session)?;
-        let id = target["session_id"]
-            .as_str()
+        let id = target
+            .session_id
+            .as_deref()
             .context("resolved session has no ID")?;
         ensure!(
             id.starts_with("session:"),
@@ -90,11 +95,12 @@ impl Control {
             .await?;
         let target = resolved_target(&reply, "block", block)?;
         ensure!(
-            target["session_id"] == session_id,
+            target.session_id.as_deref() == Some(session_id.as_str()),
             "resolved block belongs to a different session"
         );
-        let block_id = target["block_id"]
-            .as_str()
+        let block_id = target
+            .block_id
+            .as_deref()
             .context("resolved block has no ID")?
             .to_owned();
         ensure!(
@@ -151,7 +157,7 @@ impl Control {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let value = next_json(&mut self.socket).await?;
-                // Events carry session changes; this prototype needs only the data stream.
+                // Match the outstanding RPC while retaining subscribed session events.
                 if value["type"] == "response" && value["id"] == id {
                     self.response_seq = value["seq"].as_u64().unwrap_or(0);
                     ensure!(
@@ -180,41 +186,45 @@ impl Control {
     }
 }
 
-fn resolved_target<'a>(reply: &'a Value, kind: &str, query: &str) -> Result<&'a Value> {
-    let results = reply["results"]
-        .as_array()
-        .context("target.resolve response has no results")?;
-    ensure!(results.len() == 1, "expected one target.resolve result");
-    let result = &results[0];
-    match result["status"].as_str() {
-        Some("resolved") => {
-            let target = &result["target"];
+fn resolved_target(reply: &Value, kind: &str, query: &str) -> Result<crate::wire::ResolvedTarget> {
+    use crate::wire::{Resolution, ResolveReply};
+    let mut reply: ResolveReply = crate::wire::decode(reply, "target.resolve response")?;
+    ensure!(
+        reply.results.len() == 1,
+        "expected one target.resolve result"
+    );
+    match reply.results.pop().expect("one resolution") {
+        Resolution::Resolved { target } => {
             ensure!(
-                target["kind"] == kind,
+                target.kind == kind,
                 "resolver returned an unexpected target kind"
             );
             Ok(target)
         }
-        Some("ambiguous") => {
-            let choices = result["candidates"]
-                .as_array()
-                .into_iter()
-                .flatten()
+        Resolution::Ambiguous { candidates } => {
+            let choices = candidates
+                .iter()
                 .map(|target| {
-                    let id = target[format!("{kind}_id")]
-                        .as_str()
-                        .unwrap_or("unknown ID");
-                    let label = target["label"].as_str().unwrap_or("");
-                    format!("{label} ({id})")
+                    let id = if kind == "session" {
+                        &target.session_id
+                    } else {
+                        &target.block_id
+                    };
+                    format!(
+                        "{} ({})",
+                        target.label.as_deref().unwrap_or(""),
+                        id.as_deref().unwrap_or("unknown ID")
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!("ambiguous {kind} {query:?}; use a full ID. Candidates: {choices}")
         }
-        _ => bail!(
+        Resolution::NotFound { reason } => bail!(
             "{kind} {query:?} not found: {}",
-            result["reason"].as_str().unwrap_or("no matching target")
+            reason.as_deref().unwrap_or("no matching target")
         ),
+        Resolution::Unknown => bail!("{kind} {query:?} not found: no matching target"),
     }
 }
 
@@ -331,7 +341,7 @@ mod tests {
             let mut state = crate::terminal::State::new(welcome.nonce);
             loop {
                 state.feed(&crate::stream::next_binary(&mut client_data).await?)?;
-                if let Some(terminal) = state.terminal.as_mut() {
+                if let Ok(terminal) = state.terminal_mut() {
                     let text = crate::terminal::frame(terminal, 20, 3, false)?;
                     if text.contains("live output") {
                         ensure!(text.contains("existing screen"));

@@ -68,34 +68,7 @@ impl Grid {
                     break;
                 }
                 x += 1;
-                let style = cell.style()?;
-                let wide = cell.raw_cell()?.wide()?;
-                let mut fg = rgb(cell.fg_color()?.unwrap_or(colors.foreground));
-                let mut bg = rgb(cell.bg_color()?.unwrap_or(colors.background));
-                if style.inverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                if style.faint {
-                    for c in &mut fg {
-                        *c /= 2;
-                    }
-                }
-                let mut text = String::new();
-                if !style.invisible && wide != CellWide::SpacerTail && wide != CellWide::SpacerHead
-                {
-                    cell.graphemes_utf8(&mut text)?;
-                }
-                grid.cells.push(Cell {
-                    text,
-                    fg,
-                    bg,
-                    wide: wide == CellWide::Wide,
-                    tail: wide == CellWide::SpacerTail,
-                    bold: style.bold,
-                    italic: style.italic,
-                    underline: style.underline != Underline::None,
-                    strike: style.strikethrough,
-                });
+                grid.cells.push(capture_cell(cell, &colors)?);
             }
         }
         Ok(grid)
@@ -218,94 +191,171 @@ impl Rasterizer {
         })
     }
     pub fn render(&mut self, grid: &Grid) -> DynamicImage {
-        const CW: u32 = 9;
-        const CH: u32 = 18;
         let mut image = RgbaImage::new(u32::from(grid.cols) * CW, u32::from(grid.rows) * CH);
         for (index, cell) in grid.cells.iter().enumerate() {
-            let x = index as u32 % u32::from(grid.cols) * CW;
-            let y = index as u32 / u32::from(grid.cols) * CH;
-            for py in y..y + CH {
-                for px in x..x + CW {
-                    image.put_pixel(px, py, Rgba([cell.bg[0], cell.bg[1], cell.bg[2], 255]));
-                }
-            }
+            Canvas::new(&mut image, cell, index, grid.cols, self.baseline).background();
         }
-        for (index, cell) in grid.cells.iter().enumerate() {
-            if cell.tail {
-                continue;
-            }
-            let x = index as u32 % u32::from(grid.cols) * CW;
-            let y = index as u32 / u32::from(grid.cols) * CH;
-            let cell_width = if cell.wide { 2 * CW } else { CW };
-            let baseline = self.baseline;
+        for (index, cell) in grid.cells.iter().enumerate().filter(|(_, c)| !c.tail) {
+            let mut canvas = Canvas::new(&mut image, cell, index, grid.cols, self.baseline);
             for ch in cell
                 .text
                 .chars()
                 .filter(|c| !c.is_control() && !c.is_whitespace())
             {
-                let glyph = self.glyph(ch);
-                for gy in 0..glyph.metrics.height {
-                    for gx in 0..glyph.metrics.width {
-                        let alpha = u16::from(glyph.bitmap[gy * glyph.metrics.width + gx]);
-                        if alpha == 0 {
-                            continue;
-                        }
-                        let skew = if cell.italic {
-                            (glyph.metrics.height - gy) as i32 / 5
-                        } else {
-                            0
-                        };
-                        let px = x as i32 + glyph.metrics.xmin + gx as i32 + skew;
-                        let py =
-                            y as i32 + baseline - glyph.metrics.height as i32 - glyph.metrics.ymin
-                                + gy as i32;
-                        for bold in 0..=u32::from(cell.bold) {
-                            let px = px + bold as i32;
-                            if px < x as i32
-                                || px >= (x + cell_width).min(image.width()) as i32
-                                || py < y as i32
-                                || py >= (y + CH) as i32
-                            {
-                                continue;
-                            }
-                            let pixel = image.get_pixel_mut(px as u32, py as u32);
-                            for channel in 0..3 {
-                                pixel[channel] = ((u16::from(cell.fg[channel]) * alpha
-                                    + u16::from(pixel[channel]) * (255 - alpha))
-                                    / 255) as u8;
-                            }
-                        }
-                    }
-                }
+                canvas.glyph(self.glyph(ch));
             }
-            for (enabled, offset) in [(cell.underline, 16), (cell.strike, 9)] {
-                if enabled {
-                    for px in x..(x + cell_width).min(image.width()) {
-                        image.put_pixel(
-                            px,
-                            y + offset,
-                            Rgba([cell.fg[0], cell.fg[1], cell.fg[2], 255]),
-                        );
-                    }
-                }
-            }
+            canvas.decorations();
         }
-        if let Some((cx, cy)) = grid.cursor
-            && cx < grid.cols
-            && cy < grid.rows
-        {
-            let color = Rgba([
-                grid.cursor_color[0],
-                grid.cursor_color[1],
-                grid.cursor_color[2],
-                255,
-            ]);
-            for dx in 0..CW {
-                image.put_pixel(u32::from(cx) * CW + dx, u32::from(cy) * CH + CH - 2, color);
-            }
-        }
+        grid.draw_cursor(&mut image);
         DynamicImage::ImageRgba8(image)
     }
+}
+
+const CW: u32 = 9;
+const CH: u32 = 18;
+struct Canvas<'a> {
+    image: &'a mut RgbaImage,
+    cell: &'a Cell,
+    x: u32,
+    y: u32,
+    right: u32,
+    baseline: i32,
+}
+impl<'a> Canvas<'a> {
+    fn new(
+        image: &'a mut RgbaImage,
+        cell: &'a Cell,
+        index: usize,
+        cols: u16,
+        baseline: i32,
+    ) -> Self {
+        let x = index as u32 % u32::from(cols) * CW;
+        let y = index as u32 / u32::from(cols) * CH;
+        let right = (x + if cell.wide { 2 * CW } else { CW }).min(image.width());
+        Self {
+            image,
+            cell,
+            x,
+            y,
+            right,
+            baseline,
+        }
+    }
+    fn background(&mut self) {
+        for py in self.y..self.y + CH {
+            for px in self.x..self.x + CW {
+                self.image.put_pixel(
+                    px,
+                    py,
+                    Rgba([self.cell.bg[0], self.cell.bg[1], self.cell.bg[2], 255]),
+                );
+            }
+        }
+    }
+    fn glyph(&mut self, glyph: &Glyph) {
+        for gy in 0..glyph.metrics.height {
+            for gx in 0..glyph.metrics.width {
+                let alpha = u16::from(glyph.bitmap[gy * glyph.metrics.width + gx]);
+                if alpha == 0 {
+                    continue;
+                }
+                let skew = if self.cell.italic {
+                    (glyph.metrics.height - gy) as i32 / 5
+                } else {
+                    0
+                };
+                let px = self.x as i32 + glyph.metrics.xmin + gx as i32 + skew;
+                let py = self.y as i32 + self.baseline
+                    - glyph.metrics.height as i32
+                    - glyph.metrics.ymin
+                    + gy as i32;
+                self.blend(px, py, alpha);
+            }
+        }
+    }
+    fn blend(&mut self, px: i32, py: i32, alpha: u16) {
+        if py < self.y as i32 || py >= (self.y + CH) as i32 {
+            return;
+        }
+        for bold in 0..=u32::from(self.cell.bold) {
+            let px = px + bold as i32;
+            if px < self.x as i32 || px >= self.right as i32 {
+                continue;
+            }
+            let pixel = self.image.get_pixel_mut(px as u32, py as u32);
+            for channel in 0..3 {
+                pixel[channel] = ((u16::from(self.cell.fg[channel]) * alpha
+                    + u16::from(pixel[channel]) * (255 - alpha))
+                    / 255) as u8;
+            }
+        }
+    }
+    fn decorations(&mut self) {
+        for (enabled, offset) in [(self.cell.underline, 16), (self.cell.strike, 9)] {
+            if !enabled {
+                continue;
+            }
+            for px in self.x..self.right {
+                self.image.put_pixel(
+                    px,
+                    self.y + offset,
+                    Rgba([self.cell.fg[0], self.cell.fg[1], self.cell.fg[2], 255]),
+                );
+            }
+        }
+    }
+}
+impl Grid {
+    fn draw_cursor(&self, image: &mut RgbaImage) {
+        let Some((cx, cy)) = self
+            .cursor
+            .filter(|(x, y)| *x < self.cols && *y < self.rows)
+        else {
+            return;
+        };
+        let color = Rgba([
+            self.cursor_color[0],
+            self.cursor_color[1],
+            self.cursor_color[2],
+            255,
+        ]);
+        for dx in 0..CW {
+            image.put_pixel(u32::from(cx) * CW + dx, u32::from(cy) * CH + CH - 2, color);
+        }
+    }
+}
+
+fn capture_cell(
+    cell: &ghostty_vt::render::CellIteration<'_>,
+    colors: &ghostty_vt::render::Colors,
+) -> Result<Cell> {
+    let style = cell.style()?;
+    let wide = cell.raw_cell()?.wide()?;
+    let mut fg = rgb(cell.fg_color()?.unwrap_or(colors.foreground));
+    let mut bg = rgb(cell.bg_color()?.unwrap_or(colors.background));
+    if style.inverse {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if style.faint {
+        for c in &mut fg {
+            *c /= 2;
+        }
+    }
+    let mut text = String::new();
+    if !style.invisible && wide != CellWide::SpacerTail && wide != CellWide::SpacerHead {
+        cell.graphemes_utf8(&mut text)?;
+    }
+    Ok(Cell {
+        text,
+        fg,
+        bg,
+        wide: wide == CellWide::Wide,
+        tail: wide == CellWide::SpacerTail,
+        bold: style.bold,
+        italic: style.italic,
+        underline: style.underline != Underline::None,
+        strike: style.strikethrough,
+    })
 }
 
 #[cfg(test)]

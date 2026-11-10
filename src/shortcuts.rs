@@ -1,45 +1,9 @@
 //! Configurable local actions. Input remains a byte stream; unbound terminal keys
 //! and bracketed pastes are forwarded unchanged, including fragmented sequences.
+use crate::action::Action;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf};
-
-pub const BROWSER_ACTIONS: &[&str] = &[
-    "client.shortcuts",
-    "client.browser.up",
-    "client.browser.down",
-    "client.browser.left",
-    "client.browser.right",
-    "client.browser.choose",
-    "client.browser.exit",
-    "session.refresh",
-    "client.create",
-    "client.rename",
-    "client.close",
-    "session.new",
-    "session.rename",
-    "session.close",
-    "client.tab.new",
-    "client.tab.rename",
-    "client.tab.close",
-    "pane.split",
-    "pane.split.right",
-    "pane.split.down",
-    "pane.rename",
-    "pane.close",
-];
-pub const TERMINAL_ACTIONS: &[&str] = &[
-    "client.shortcuts",
-    "pane.split",
-    "pane.split.right",
-    "pane.split.down",
-    "pane.focus_next",
-    "client.tab.new",
-    "client.tab.next",
-    "client.tab.previous",
-    "client.detach",
-    "client.send_prefix",
-];
 
 pub fn defaults() -> Value {
     json!({"shortcuts": {
@@ -47,7 +11,7 @@ pub fn defaults() -> Value {
             "up":"client.browser.up", "k":"client.browser.up", "down":"client.browser.down", "j":"client.browser.down",
             "left":"client.browser.left", "h":"client.browser.left", "right":"client.browser.right", "l":"client.browser.right",
             "enter":"client.browser.choose", "esc":"client.browser.exit", "q":"client.browser.exit", "ctrl+c":"client.browser.exit",
-            "?":"client.shortcuts", "c":"client.create", "x":"client.close", "r":"client.rename", "ctrl+r":"session.refresh"
+            "?":"client.shortcuts", "p":"client.browser.toggle_preview", "c":"client.create", "x":"client.close", "r":"client.rename", "ctrl+r":"session.refresh"
         },
         "terminal": {
             "ctrl+b>ctrl+shift+'":"pane.split.down", "ctrl+b>ctrl+shift+5":"pane.split.right",
@@ -60,10 +24,11 @@ pub fn defaults() -> Value {
 
 #[derive(Clone, Default)]
 pub struct Bindings {
-    encoded: Vec<(Vec<u8>, String)>,
-    pub display: Vec<(String, String)>,
+    encoded: Vec<(Vec<u8>, Action)>,
+    pub display: Vec<(String, Action)>,
 }
 pub struct Config {
+    pub preview_layout: crate::browser::PreviewLayout,
     pub browser: Bindings,
     pub terminal: Bindings,
 }
@@ -113,7 +78,7 @@ impl Config {
         };
         Self::parse(value).with_context(|| format!("invalid configuration in {}", path.display()))
     }
-    fn parse(value: Value) -> Result<Self> {
+    pub(crate) fn parse(value: Value) -> Result<Self> {
         ensure!(
             value.is_null() || value.is_object(),
             "config must be an object"
@@ -127,53 +92,62 @@ impl Config {
                 );
             }
         }
-        let default = defaults();
-        let build = |section: &str, allowed: &[&str]| -> Result<Bindings> {
-            let mut map: BTreeMap<String, Value> = default["shortcuts"][section]
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if let Some(overrides) = value.get("shortcuts").and_then(|v| v.get(section)) {
-                for (key, action) in overrides
-                    .as_object()
-                    .context("shortcut section must be an object")?
-                {
-                    map.insert(key.clone(), action.clone());
-                }
-            }
-            let mut bindings = BTreeMap::new();
-            let mut display = Vec::new();
-            for (key, action) in map {
-                let sequences = sequences(&key).with_context(|| format!("shortcut {key:?}"))?;
-                if action.is_null() {
-                    continue;
-                }
-                let action = action
-                    .as_str()
-                    .context("shortcut action must be a string or null")?;
-                ensure!(
-                    allowed.contains(&action),
-                    "unsupported {section} action: {action}"
-                );
-                display.push((key.clone(), action.to_owned()));
-                for bytes in sequences {
-                    if let Some(old) = bindings.insert(bytes, action.to_owned()) {
-                        ensure!(old == action, "conflicting shortcut encodings for {key}");
-                    }
-                }
-            }
-            Ok(Bindings {
-                encoded: bindings.into_iter().collect(),
-                display,
-            })
-        };
         Ok(Self {
-            browser: build("browser", BROWSER_ACTIONS)?,
-            terminal: build("terminal", TERMINAL_ACTIONS)?,
+            preview_layout: value
+                .get("preview_layout")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("preview_layout must be column or row")?
+                .unwrap_or_default(),
+            browser: build("browser", &value)?,
+            terminal: build("terminal", &value)?,
         })
     }
+}
+fn build(section: &str, value: &Value) -> Result<Bindings> {
+    let default = defaults();
+
+    let mut map: BTreeMap<String, Value> = default["shortcuts"][section]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if let Some(overrides) = value.get("shortcuts").and_then(|v| v.get(section)) {
+        for (key, action) in overrides
+            .as_object()
+            .context("shortcut section must be an object")?
+        {
+            map.insert(key.clone(), action.clone());
+        }
+    }
+    let mut bindings = BTreeMap::new();
+    let mut display = Vec::new();
+    for (key, action) in map {
+        let sequences = sequences(&key).with_context(|| format!("shortcut {key:?}"))?;
+        if action.is_null() {
+            continue;
+        }
+        let action = action
+            .as_str()
+            .context("shortcut action must be a string or null")?;
+        let action: Action = action.parse()?;
+        ensure!(
+            action.allowed(section == "terminal"),
+            "unsupported {section} action: {action}"
+        );
+        display.push((key.clone(), action));
+        for bytes in sequences {
+            if let Some(old) = bindings.insert(bytes, action) {
+                ensure!(old == action, "conflicting shortcut encodings for {key}");
+            }
+        }
+    }
+    Ok(Bindings {
+        encoded: bindings.into_iter().collect(),
+        display,
+    })
 }
 pub fn path() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_DIR")
@@ -200,7 +174,17 @@ fn sequences(key: &str) -> Result<Vec<Vec<u8>>> {
     Ok(result)
 }
 fn chord(key: &str) -> Result<Vec<Vec<u8>>> {
-    let named = match key.to_ascii_lowercase().as_str() {
+    let named = named_key(key);
+    if let Some(v) = named {
+        return Ok(v);
+    }
+    if key.chars().count() == 1 {
+        return Ok(vec![key.as_bytes().to_vec()]);
+    }
+    modified_key(key)
+}
+fn named_key(key: &str) -> Option<Vec<Vec<u8>>> {
+    match key.to_ascii_lowercase().as_str() {
         "up" => Some(vec![b"\x1b[A".to_vec(), b"\x1bOA".to_vec()]),
         "down" => Some(vec![b"\x1b[B".to_vec(), b"\x1bOB".to_vec()]),
         "right" => Some(vec![b"\x1b[C".to_vec(), b"\x1bOC".to_vec()]),
@@ -210,13 +194,9 @@ fn chord(key: &str) -> Result<Vec<Vec<u8>>> {
         "tab" => Some(vec![vec![9]]),
         "space" => Some(vec![vec![32]]),
         _ => None,
-    };
-    if let Some(v) = named {
-        return Ok(v);
     }
-    if key.chars().count() == 1 {
-        return Ok(vec![key.as_bytes().to_vec()]);
-    }
+}
+fn modified_key(key: &str) -> Result<Vec<Vec<u8>>> {
     let mut ctrl = false;
     let mut shift = false;
     let mut alt = false;
@@ -268,7 +248,7 @@ fn chord(key: &str) -> Result<Vec<Vec<u8>>> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     Raw(Vec<u8>),
-    Action(String, Vec<u8>),
+    Action(Action, Vec<u8>),
 }
 impl Event {
     pub fn bytes(self) -> Vec<u8> {
@@ -331,10 +311,7 @@ impl Matcher {
                 });
             if !longer {
                 if let Some((_, action)) = exact {
-                    events.push(Event::Action(
-                        action.clone(),
-                        std::mem::take(&mut self.pending),
-                    ));
+                    events.push(Event::Action(*action, std::mem::take(&mut self.pending)));
                 } else {
                     self.flush(&mut events);
                 }
@@ -356,10 +333,7 @@ impl Matcher {
             .iter()
             .find(|(key, _)| *key == self.pending)
         {
-            events.push(Event::Action(
-                action.clone(),
-                std::mem::take(&mut self.pending),
-            ));
+            events.push(Event::Action(*action, std::mem::take(&mut self.pending)));
         } else {
             self.flush(&mut events);
         }
@@ -420,6 +394,27 @@ mod tests {
     }
     #[test]
     fn config_overrides_unbinds_and_rejects_invalid_actions() {
+        assert_eq!(
+            Config::parse(json!({"preview_layout":"row"}))
+                .unwrap()
+                .preview_layout,
+            crate::browser::PreviewLayout::Row
+        );
+        assert_eq!(
+            Config::parse(json!({"preview_layout":"column"}))
+                .unwrap()
+                .preview_layout,
+            crate::browser::PreviewLayout::Column
+        );
+        for value in [Value::Null, json!({})] {
+            assert_eq!(
+                Config::parse(value).unwrap().preview_layout,
+                crate::browser::PreviewLayout::Row
+            );
+        }
+        for invalid in [json!("bottom"), json!(false), Value::Null] {
+            assert!(Config::parse(json!({"preview_layout":invalid})).is_err());
+        }
         let config =
             Config::parse(json!({"shortcuts":{"browser":{"r":null,"z":"client.rename"}}})).unwrap();
         assert!(
