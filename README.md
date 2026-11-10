@@ -8,10 +8,36 @@ machine hosting Rex.
 ## Demo
 [recording.webm](https://github.com/user-attachments/assets/c1e79784-9ac1-4e3a-a7b0-5701e2a2edf7)
 
+## Install a release
+
+Download an archive from the repository's GitHub Releases page for your platform:
+
+| Platform | Archive target |
+| --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-musl` |
+| Linux ARM64 | `aarch64-unknown-linux-musl` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+
+Each archive includes `rex-attach`, documentation, and an example configuration.
+Verify the accompanying `.sha256` file with `sha256sum -c` on Linux or
+`shasum -a 256 -c` on macOS, extract the archive, and put `rex-attach` on your
+`PATH`. Linux binaries are static; Nix is not required to run release binaries.
+Graphical previews need an installed monospace font or `--preview-font`.
 
 ## Build
 
 With [Nix](https://nixos.org/):
+
+```sh
+nix build .#rex-attach
+./result/bin/rex-attach --help
+```
+
+The flake exports `packages.<system>.rex-attach` and `packages.<system>.default`.
+The package fetches pinned Cargo, Ghostty, and Zig dependencies separately so
+compilation and tests run without network access in the Nix build sandbox.
+
+For development:
 
 ```sh
 nix develop
@@ -23,6 +49,38 @@ below. Without Nix, install Rust 1.96+, a C toolchain, pkg-config, and Zig 0.17.
 then run the same Cargo command. The first native build downloads pinned Ghostty
 sources and dependencies, so it needs network access. See
 [THIRD_PARTY.md](THIRD_PARTY.md) for native dependency details.
+
+### Install on NixOS
+
+Add the flake as an input and include its package in your configuration. For
+example, in your system's `flake.nix`:
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.rex-attach.url = "github:nivox/rex-attach";
+
+  outputs = { nixpkgs, rex-attach, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux"; # Or aarch64-linux.
+      modules = [
+        ./configuration.nix
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            rex-attach.packages.${pkgs.stdenv.hostPlatform.system}.rex-attach
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+Graphical previews use your system's monospace fonts. Configure
+`fonts.packages = [ pkgs.dejavu_fonts ];` if you need one, or select an existing
+font with `--preview-font`.
+
+See [RELEASE.md](RELEASE.md) for release builds, versioning, and publishing.
 
 ## Use
 

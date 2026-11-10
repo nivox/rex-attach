@@ -8,6 +8,13 @@ Builds require Zig 0.17.x unless a compatible static library is supplied as
 libghostty-vt-static via pkg-config. The direct ghostty-vt-sys dependency enables
 that pkg-config build option.
 
+The flake package in [nix/package.nix](nix/package.nix) fetches the same pinned
+Ghostty source and its Zig dependencies before the sandboxed Cargo build.
+When updating `ghostty-vt-sys`, update that source URL and the source/dependency
+hashes to match the new crate's `GHOSTTY.lock`.
+Package evaluation rejects a version mismatch with either Ghostty crate in
+`Cargo.lock` or a source revision inconsistent with the pinned version.
+
 `src/vt.rs` and `src/vt/` are original, application-specific adapters over the
 published native C API. They own the terminal/render handles needed by this
 client and expose borrowed render cursors and owned image geometry. Public types,

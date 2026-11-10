@@ -11,6 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
+      - name: Test release script
+        run: nix develop --command python3 -m unittest discover -s scripts -p 'test_release.py'
+      - name: Check flake outputs and Ghostty pin
+        run: nix flake check --no-build --all-systems
       - name: Check formatting
         run: nix develop --command cargo fmt --all -- --check
       - name: Test

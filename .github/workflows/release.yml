@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Cache the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-release-${{ runner.os }}-${{ runner.arch }}-
+      - name: Cache Cargo and Zig builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cache/zig
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            release-${{ matrix.target }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}-
+            release-${{ matrix.target }}-
+      - name: Check flake outputs and Ghostty pin
+        run: nix flake check --no-build --all-systems
+      - name: Verify version and build in the flake release shell
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          # Variables expand inside the Nix shell.
+          # shellcheck disable=SC2016
+          nix develop .#release --command bash -euo pipefail -c '
+            test "$CARGO_BUILD_TARGET" = "$RELEASE_TARGET"
+            version=$(cargo metadata --locked --no-deps --format-version 1 |
+              jq -r ".packages[] | select(.name == \"rex-attach\") | .version")
+            if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "Tag $GITHUB_REF_NAME does not match Cargo version v$version" >&2
+              exit 1
+            fi
+            cargo build --release --locked
+          '
+      - name: Smoke test and package binary
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary="target/$RELEASE_TARGET/release/rex-attach"
+          # Run outside Nix to catch missing libraries or Nix store loaders.
+          "$binary" --version
+          "$binary" --help > /dev/null
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            headers=$(readelf -l "$binary")
+            dynamic=$(readelf -d "$binary")
+            if [[ "$headers" == *INTERP* || "$dynamic" == *NEEDED* ]]; then
+              echo 'Linux release binary must be statically linked' >&2
+              exit 1
+            fi
+          else
+            libraries=$(otool -L "$binary")
+            if [[ "$libraries" == */nix/store/* ]]; then
+              echo 'macOS release binary must not depend on the Nix store' >&2
+              exit 1
+            fi
+          fi
+          dist="rex-attach-$RELEASE_TARGET"
+          mkdir -p "$dist"
+          cp "$binary" "$dist/rex-attach"
+          chmod 755 "$dist/rex-attach"
+          cp README.md THIRD_PARTY.md config.example.json "$dist/"
+          tar -czf "$dist.tar.gz" "$dist"
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256"
+          else
+            shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rex-attach-${{ matrix.target }}
+          path: |
+            rex-attach-${{ matrix.target }}.tar.gz
+            rex-attach-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rex-attach-*
+          merge-multiple: true
+          path: dist
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            prerelease=()
+            if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+              prerelease+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "${prerelease[@]}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
