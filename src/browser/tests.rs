@@ -152,7 +152,7 @@ fn test_screen(browser: &Browser, size: (u16, u16), text: &str) -> String {
                 },
                 &Snapshot::default(),
                 "",
-            )
+            );
         })
         .unwrap();
     let buffer = terminal.backend().buffer();
@@ -229,10 +229,14 @@ fn kitty_preview_has_visible_placements_in_ghostty() -> Result<()> {
                     &crate::preview::Frame::default(),
                     &Snapshot::default(),
                     "",
-                )
+                );
             })?;
-            terminal.draw(|frame| render(frame, &browser, &preview, &Snapshot::default(), ""))?;
-            terminal.draw(|frame| render(frame, &browser, &preview, &Snapshot::default(), ""))?;
+            terminal.draw(|frame| {
+                render(frame, &browser, &preview, &Snapshot::default(), "");
+            })?;
+            terminal.draw(|frame| {
+                render(frame, &browser, &preview, &Snapshot::default(), "");
+            })?;
         }
         assert!(
             visible_images(&output) > 0,
@@ -521,7 +525,7 @@ fn information_and_preview_split_evenly_and_status_reaches_all_columns() {
                 },
                 &snapshot,
                 "",
-            )
+            );
         })
         .unwrap();
     let buffer = terminal.backend().buffer();
@@ -663,5 +667,61 @@ fn pure_transitions_keep_help_and_dialogs_modal() -> Result<()> {
         browser.feed(action("client.browser.exit"))?,
         Effect::Exit
     ));
+    Ok(())
+}
+
+#[test]
+fn mouse_uses_rendered_offsets_and_respects_modal_boundaries() -> Result<()> {
+    use crate::{mouse::Mouse, shortcuts::Event};
+    let mut browser = Browser {
+        sessions: vec![fixture()],
+        ..Default::default()
+    };
+    let template = browser.sessions[0].windows[0].clone();
+    browser.sessions[0].windows = (0..30)
+        .map(|n| {
+            let mut window = template.clone();
+            window.id = format!("window:{n}");
+            window.name = format!("tab {n}");
+            window
+        })
+        .collect();
+    browser.window = 25;
+    browser.preview_hidden = true;
+    let mut screen = UiTerminal::new(ratatui::backend::TestBackend::new(80, 10))?;
+    let mut hits = vec![];
+    screen.draw(|frame| {
+        hits = render(
+            frame,
+            &browser,
+            &crate::preview::Frame::default(),
+            &Snapshot::default(),
+            "",
+        );
+    })?;
+    let press = Mouse::parse(b"\x1b[<0;45;3M").unwrap();
+    let hit = hits.iter().find_map(|h| h.at(press)).unwrap();
+    assert_eq!(hit.0, Focus::Windows);
+    assert!(
+        hit.1 > 0 && hit.1 < 25,
+        "hit must account for scrolled list offset"
+    );
+    browser.mouse(press, Some(hit), false)?;
+    assert_eq!(browser.window, hit.1);
+    assert_eq!(browser.focus, Focus::Windows);
+    assert!(matches!(
+        browser.mouse(press, Some(hit), true)?,
+        Effect::Attach(_)
+    ));
+    let wheel = Mouse::parse(b"\x1b[<65;45;3M").unwrap();
+    browser.mouse(wheel, Some(hit), false)?;
+    assert_eq!(browser.window, hit.1 + 1);
+    browser.dialog = Some(browser.start_dialog("client.rename")?);
+    let selected = browser.window;
+    let text = browser.dialog.as_ref().unwrap().text.clone();
+    browser.mouse(press, Some((Focus::Windows, 0)), true)?;
+    browser.feed(Event::Mouse(wheel))?;
+    assert_eq!(browser.window, selected);
+    assert_eq!(browser.dialog.as_ref().unwrap().text, text);
     Ok(())
 }

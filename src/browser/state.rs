@@ -35,6 +35,55 @@ pub struct Browser {
     pub(super) focus: Focus,
 }
 impl Browser {
+    pub(super) fn mouse(
+        &mut self,
+        mouse: crate::mouse::Mouse,
+        hit: Option<(Focus, usize)>,
+        activate: bool,
+    ) -> Result<Effect> {
+        if self.help.is_some() {
+            return self.feed(crate::shortcuts::Event::Mouse(mouse));
+        }
+        if self.dialog.is_some() {
+            return Ok(Effect::None);
+        }
+        let Some((focus, index)) = hit else {
+            return Ok(Effect::None);
+        };
+        if let Some((_, dy)) = mouse.wheel() {
+            if dy != 0 {
+                self.focus = focus;
+                self.vertical(dy > 0);
+            }
+        } else if mouse.left_press() {
+            self.focus = focus;
+            match focus {
+                Focus::Sessions => {
+                    if self.session != index {
+                        self.session = index;
+                        self.window = 0;
+                        self.block = 0;
+                    }
+                }
+                Focus::Windows => {
+                    if self.window != index {
+                        self.window = index;
+                        self.block = 0;
+                    }
+                }
+                Focus::Blocks => self.block = index,
+            }
+            self.normalize();
+            if activate {
+                return self.feed(crate::shortcuts::Event::Action(
+                    crate::action::Action::ClientBrowserChoose,
+                    vec![],
+                ));
+            }
+        }
+        Ok(Effect::None)
+    }
+
     pub(super) fn inspection(&self) -> activity::Request {
         activity::Request {
             targets: self

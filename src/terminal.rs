@@ -83,6 +83,49 @@ impl State {
     }
 }
 
+/// Local wheel scrolling never writes to Rex. Semantic mouse events are encoded
+/// by Rex against the authoritative remote modes, including legacy byte formats.
+pub fn route_input(
+    terminal: &mut Terminal,
+    events: Vec<crate::shortcuts::Event>,
+    size: (u16, u16),
+) -> Result<Vec<crate::shortcuts::Event>> {
+    use crate::shortcuts::Event;
+    use ghostty_vt::{
+        screen::Screen,
+        terminal::{Mode, ScrollViewport},
+    };
+    let mut routed = Vec::new();
+    for event in events {
+        if let Event::Mouse(mouse) = event {
+            if mouse.x >= size.0.min(terminal.cols()?) || mouse.y >= size.1.min(terminal.rows()?) {
+                continue;
+            }
+            if terminal.is_mouse_tracking()? {
+                if terminal.is_viewport_active()? {
+                    routed.push(Event::Mouse(mouse));
+                }
+            } else if let Some((_, dy)) = mouse.wheel() {
+                if terminal.active_screen()? == Screen::Primary {
+                    terminal.scroll_viewport(ScrollViewport::Delta(dy as isize * 3));
+                } else if terminal.mode(Mode::ALT_SCROLL)? && dy != 0 {
+                    let arrow = match (terminal.mode(Mode::DECCKM)?, dy < 0) {
+                        (true, true) => b"\x1bOA",
+                        (true, false) => b"\x1bOB",
+                        (false, true) => b"\x1b[A",
+                        (false, false) => b"\x1b[B",
+                    };
+                    routed.push(Event::Raw(arrow.to_vec()));
+                }
+            }
+        } else {
+            terminal.scroll_viewport(ScrollViewport::Bottom);
+            routed.push(event);
+        }
+    }
+    Ok(routed)
+}
+
 // Text capture remains stateless; interactive output reuses Renderer below.
 pub fn frame(terminal: &mut Terminal, width: u16, height: u16, ansi: bool) -> Result<String> {
     if ansi {
@@ -222,6 +265,58 @@ mod tests {
     use super::ratatui_backend::Renderer;
     use super::*;
     use ghostty_vt::{TerminalOptions, snapshot};
+
+    #[test]
+    fn mouse_routing_respects_tracking_history_and_alternate_scroll() -> Result<()> {
+        use crate::{mouse::Mouse, shortcuts::Event};
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 120,
+            rows: 4,
+            ..Default::default()
+        })?;
+        for n in 0..20 {
+            terminal.vt_write(format!("line {n}\r\n").as_bytes());
+        }
+        let wheel = || Event::Mouse(Mouse::parse(b"\x1b[<64;110;2M").unwrap());
+        assert!(route_input(&mut terminal, vec![wheel()], (120, 4))?.is_empty());
+        assert!(!terminal.is_viewport_active()?);
+        for backend in [Backend::Ansi, Backend::Ratatui] {
+            let mut renderer = super::Renderer::new(backend)?;
+            let mut display = Terminal::new(TerminalOptions {
+                cols: 120,
+                rows: 4,
+                ..Default::default()
+            })?;
+            display.vt_write(renderer.frame(&terminal, 120, 4)?.as_bytes());
+            assert_eq!(
+                frame(&mut display, 120, 4, false)?,
+                frame(&mut terminal, 120, 4, false)?
+            );
+            terminal.scroll_viewport(ghostty_vt::terminal::ScrollViewport::Bottom);
+            display.vt_write(renderer.frame(&terminal, 120, 4)?.as_bytes());
+            assert_eq!(
+                frame(&mut display, 120, 4, false)?,
+                frame(&mut terminal, 120, 4, false)?
+            );
+            route_input(&mut terminal, vec![wheel()], (120, 4))?;
+        }
+        route_input(&mut terminal, vec![Event::Raw(b"a".to_vec())], (120, 4))?;
+        assert!(terminal.is_viewport_active()?);
+        terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
+        assert!(matches!(
+            route_input(&mut terminal, vec![wheel()], (120, 4))?.as_slice(),
+            [Event::Mouse(_)]
+        ));
+        assert!(route_input(&mut terminal, vec![wheel()], (80, 4))?.is_empty());
+        terminal.vt_write(b"\x1b[?1000l\x1b[?1049h\x1b[?1007l");
+        assert!(route_input(&mut terminal, vec![wheel()], (120, 4))?.is_empty());
+        terminal.vt_write(b"\x1b[?1007h\x1b[?1h");
+        assert_eq!(
+            route_input(&mut terminal, vec![wheel()], (120, 4))?,
+            vec![Event::Raw(b"\x1bOA".to_vec())]
+        );
+        Ok(())
+    }
 
     #[test]
     fn incremental_output_matches_full_redraw_through_terminal_emulation() -> Result<()> {

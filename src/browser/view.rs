@@ -20,8 +20,54 @@ use std::{
 pub(super) struct Screen {
     pub(super) terminal: UiTerminal<CrosstermBackend<io::Stdout>>,
     pub(super) image: Option<Arc<crate::preview::RenderedImage>>,
+    hits: Vec<Hit>,
+    click: Option<(Focus, usize, Option<Target>, std::time::Instant)>,
+}
+pub(super) struct Hit {
+    area: Rect,
+    focus: Focus,
+    offset: usize,
+    len: usize,
+}
+impl Hit {
+    pub(super) fn at(&self, mouse: crate::mouse::Mouse) -> Option<(Focus, usize)> {
+        if self.len == 0 || !self.area.contains((mouse.x, mouse.y).into()) {
+            return None;
+        }
+        let row = self.offset + usize::from(mouse.y - self.area.y);
+        if mouse.wheel().is_some() {
+            Some((self.focus, row.min(self.len - 1)))
+        } else {
+            (row < self.len).then_some((self.focus, row))
+        }
+    }
 }
 impl Screen {
+    pub(super) fn mouse(
+        &mut self,
+        browser: &mut Browser,
+        mouse: crate::mouse::Mouse,
+    ) -> Result<Effect> {
+        let hit = self.hits.iter().find_map(|h| h.at(mouse));
+        let now = std::time::Instant::now();
+        let activate = mouse.left_press()
+            && hit.is_some_and(|(focus, row)| {
+                self.click.as_ref().is_some_and(|(f, r, target, time)| {
+                    *f == focus
+                        && *r == row
+                        && *target == browser.target()
+                        && now.duration_since(*time) < std::time::Duration::from_millis(400)
+                })
+            });
+        if mouse.left_press() || mouse.wheel().is_some() {
+            self.click = None;
+        }
+        let effect = browser.mouse(mouse, hit, activate)?;
+        if mouse.left_press() && !activate && browser.dialog.is_none() && browser.help.is_none() {
+            self.click = hit.map(|(f, row)| (f, row, browser.target(), now));
+        }
+        Ok(effect)
+    }
     pub(super) fn new() -> Result<Self> {
         // Our outer Guard owns raw mode and the alternate screen. Ratatui owns
         // only browser drawing, so attaching never nests terminal setup.
@@ -32,6 +78,8 @@ impl Screen {
         Ok(Self {
             terminal,
             image: None,
+            hits: vec![],
+            click: None,
         })
     }
     pub(super) fn draw(
@@ -51,7 +99,7 @@ impl Screen {
         self.terminal.backend_mut().write_all(b"\x1b[?2026h")?;
         let result = self
             .terminal
-            .draw(|frame| render(frame, browser, preview, snapshot, notice))
+            .draw(|frame| self.hits = render(frame, browser, preview, snapshot, notice))
             .map(|_| ());
         self.terminal.backend_mut().write_all(b"\x1b[?2026l")?;
         self.terminal.backend_mut().flush()?;
@@ -237,14 +285,14 @@ pub(super) fn render(
     preview: &crate::preview::Frame,
     snapshot: &Snapshot,
     notice: &str,
-) {
+) -> Vec<Hit> {
     if let Some(help) = &browser.help {
         help.render(frame, &browser.bindings, &browser.terminal_bindings);
-        return;
+        return vec![];
     }
     let area = frame.area();
     if area.is_empty() {
-        return;
+        return vec![];
     }
     if area.height > 1 {
         frame.render_widget(
@@ -259,10 +307,10 @@ pub(super) fn render(
             Paragraph::new("Widen terminal to browse (40+ cols). Esc: exit"),
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
         );
-        return;
+        return vec![];
     }
     let panes = pane_rects(browser, area);
-    render_columns(frame, browser, snapshot, &panes);
+    let hits = render_columns(frame, browser, snapshot, &panes);
     if !browser.preview_hidden {
         let [info_area, pane] = detail_rects(browser, *panes.last().unwrap());
         information(frame, browser, snapshot, info_area);
@@ -272,6 +320,7 @@ pub(super) fn render(
     if let Some(dialog) = &browser.dialog {
         dialog.render(frame);
     }
+    hits
 }
 
 impl Dialog {
@@ -381,7 +430,13 @@ fn columns(browser: &Browser, snapshot: &Snapshot) -> Vec<Column> {
     }
     columns
 }
-fn render_columns(frame: &mut UiFrame, browser: &Browser, snapshot: &Snapshot, panes: &[Rect]) {
+fn render_columns(
+    frame: &mut UiFrame,
+    browser: &Browser,
+    snapshot: &Snapshot,
+    panes: &[Rect],
+) -> Vec<Hit> {
+    let mut hits = vec![];
     for (index, (title, focus, selected, items)) in
         columns(browser, snapshot).into_iter().enumerate()
     {
@@ -390,6 +445,8 @@ fn render_columns(frame: &mut UiFrame, browser: &Browser, snapshot: &Snapshot, p
             .borders(Borders::ALL)
             .title(title)
             .border_style(Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }));
+        let len = items.len();
+        let inner = border.inner(panes[index]);
         let items = if items.is_empty() {
             vec![ListItem::new("(empty)")]
         } else {
@@ -405,7 +462,14 @@ fn render_columns(frame: &mut UiFrame, browser: &Browser, snapshot: &Snapshot, p
             });
         let mut selected = ListState::default().with_selected(Some(selected));
         frame.render_stateful_widget(list, panes[index], &mut selected);
+        hits.push(Hit {
+            area: inner,
+            focus,
+            offset: selected.offset(),
+            len,
+        });
     }
+    hits
 }
 fn render_preview(frame: &mut UiFrame, preview: &crate::preview::Frame, images: bool, pane: Rect) {
     let title = if images {

@@ -64,6 +64,7 @@ async fn browse_inner(
     pane: &mut Pane,
     data: &mut super::data::Data,
 ) -> Result<Option<Target>> {
+    let _mouse = tty::MouseGuard::enter(false)?;
     let Request {
         socket,
         control,
@@ -117,7 +118,15 @@ async fn browse_inner(
             value=control.next_event()=> {value?;vec![]},
         };
         let before = browser.target();
-        if let Some(target) = dispatch(actions, browser, data, &mut notice, &mut keys, input)? {
+        if let Some(target) = dispatch(
+            actions,
+            browser,
+            data,
+            &mut notice,
+            &mut keys,
+            input,
+            &mut screen,
+        )? {
             return Ok(target);
         }
         if browser.target() != before {
@@ -133,10 +142,14 @@ fn dispatch(
     notice: &mut String,
     keys: &mut Matcher,
     input: &mut tty::Input,
+    screen: &mut Screen,
 ) -> Result<Option<Option<Target>>> {
     let mut events = actions.into_iter();
     while let Some(event) = events.next() {
-        let effect = match browser.feed(event) {
+        let effect = match match event {
+            Event::Mouse(mouse) => screen.mouse(browser, mouse),
+            event => browser.feed(event),
+        } {
             Ok(effect) => effect,
             Err(error) => {
                 *notice = format!("{error:#}");

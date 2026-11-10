@@ -83,12 +83,57 @@ impl Guard {
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        let _ = io::stdout().write_all(b"\x1b[?2026l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
+        let _ = io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2026l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
         // SAFETY: restore the saved terminal attributes.
         unsafe {
             libc::tcsetattr(0, libc::TCSANOW, &self.termios);
         }
+    }
+}
+
+/// The outer TTY reports SGR cells; Rex owns the remote application's encoding.
+pub struct MouseGuard(Option<u16>);
+impl MouseGuard {
+    pub fn enter(motion: bool) -> io::Result<Self> {
+        let mut guard = Self(None);
+        guard.set(motion)?;
+        Ok(guard)
+    }
+    pub fn set(&mut self, motion: bool) -> io::Result<()> {
+        self.set_mode(if motion { 1003 } else { 1000 })
+    }
+    pub fn track(&mut self, terminal: &ghostty_vt::Terminal) -> anyhow::Result<()> {
+        use ghostty_vt::terminal::Mode;
+        self.set_mode(if terminal.mode(Mode::ANY_MOUSE)? {
+            1003
+        } else if terminal.mode(Mode::BUTTON_MOUSE)? {
+            1002
+        } else {
+            1000
+        })?;
+        Ok(())
+    }
+    pub fn resume(&mut self, terminal: &ghostty_vt::Terminal) -> anyhow::Result<()> {
+        self.0 = None;
+        self.track(terminal)
+    }
+    fn set_mode(&mut self, mode: u16) -> io::Result<()> {
+        if self.0 == Some(mode) {
+            return Ok(());
+        }
+        let mut out = io::stdout().lock();
+        out.write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006h")?;
+        write!(out, "\x1b[?{mode}h")?;
+        out.flush()?;
+        self.0 = Some(mode);
+        Ok(())
+    }
+}
+impl Drop for MouseGuard {
+    fn drop(&mut self) {
+        let _ = io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+        let _ = io::stdout().flush();
     }
 }
 

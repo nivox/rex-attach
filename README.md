@@ -71,7 +71,14 @@ they leave ownership, size, and focus unchanged. To print the initial screen:
 rex-attach --socket /path/to/rex.sock --session work --block shell --capture
 ```
 
-This is an early client: mouse input, scrollback UI, embedded terminal images,
+Mouse clicks select browser rows; double-click chooses a row, and the wheel
+navigates the column under the pointer or scrolls shortcut help. Attached programs
+receive mouse input when they request it. Otherwise, the wheel scrolls local
+terminal history; typing returns to the live viewport. Alternate-screen programs
+receive arrow-key scrolling only when they enable alternate-scroll mode. Use your
+outer terminal's mouse-selection override (commonly Shift) for text selection.
+
+This is an early client: scrollback search, embedded terminal images,
 and automatic reconnect are unavailable. Keyboard protocols are forwarded rather
 than translated. Interactive mode requires a terminal (`TERM=dumb` is unsupported).
 Run `rex-attach --help` for all options.

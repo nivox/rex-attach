@@ -32,6 +32,15 @@ impl Help {
     /// Help is modal: navigation/close only, with no application actions or input.
     pub fn feed(&mut self, event: Event, count: usize) -> bool {
         let (action, bytes) = match event {
+            Event::Mouse(mouse) => {
+                if let Some((_, dy)) = mouse.wheel() {
+                    self.offset = self
+                        .offset
+                        .saturating_add_signed(dy as isize * 3)
+                        .min(count.saturating_sub(self.page_rows.get().max(1)));
+                }
+                return false;
+            }
             Event::Action(a, b) => (Some(a), b),
             Event::Raw(b) => (None, b),
         };
@@ -146,6 +155,7 @@ pub async fn show_terminal(
     target: &Target,
 ) -> Result<bool> {
     let bindings = &config.terminal;
+    let _mouse = tty::MouseGuard::enter(false)?;
     let mut screen = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     screen.backend_mut().write_all(b"\x1b[0m\x1b[2J\x1b[H")?;
     let mut help = Help::default();

@@ -219,6 +219,7 @@ async fn interactive(
     backend: terminal::Backend,
 ) -> Result<Flow> {
     let bindings = &config.terminal;
+    let mut mouse = tty::MouseGuard::enter(false)?;
     let mut tick = tokio::time::interval(Duration::from_millis(16));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renderer = terminal::Renderer::new(backend)?;
@@ -228,11 +229,12 @@ async fn interactive(
     let mut dimensions = tty::size()?;
     resize(target, control, dimensions).await?;
     let mut dirty = true;
-    let mut input = Vec::new();
+    let mut input = TerminalInput::default();
     let mut keys = shortcuts::Matcher::new(bindings);
     let mut key_deadline = None;
     let mut bytes = [0u8; 4096];
     loop {
+        mouse.track(state.terminal()?)?;
         let events = tokio::select! {
             bytes = stream::next_binary(data) => { state.feed(&bytes?)?; dirty = true; None }
             value = control.next_event() => { let _ = value?; None }
@@ -258,31 +260,40 @@ async fn interactive(
                 None
             }
         };
-        if let Some(events) = events
-            && let Some(action) = crate::session::while_streaming(
+        if let Some(events) = events {
+            dirty = true;
+            let events = terminal::route_input(state.terminal_mut()?, events, dimensions)?;
+            if let Some(action) = crate::session::while_streaming(
                 terminal_events(events, &mut keys, &mut input, target, control, input_tty),
                 data,
                 state,
                 |state| draw_terminal(&mut renderer, state, dimensions),
             )
             .await?
-        {
-            match action {
-                TerminalAction::Navigate(flow) => return Ok(flow),
-                TerminalAction::Help => {
-                    if !help::show_terminal(config, input_tty, data, state, control, target).await?
-                    {
-                        return Ok(Flow::Exit);
+            {
+                match action {
+                    TerminalAction::Navigate(flow) => return Ok(flow),
+                    TerminalAction::Help => {
+                        if !help::show_terminal(config, input_tty, data, state, control, target)
+                            .await?
+                        {
+                            return Ok(Flow::Exit);
+                        }
+                        renderer = terminal::Renderer::new(backend)?;
+                        mouse.resume(state.terminal()?)?;
+                        dimensions = tty::size()?;
+                        dirty = true;
+                        keys = shortcuts::Matcher::new(bindings);
+                        key_deadline = None;
                     }
-                    renderer = terminal::Renderer::new(backend)?;
-                    dimensions = tty::size()?;
-                    dirty = true;
-                    keys = shortcuts::Matcher::new(bindings);
-                    key_deadline = None;
                 }
             }
         }
     }
+    crate::session::while_streaming(input.release(target, control), data, state, |state| {
+        draw_terminal(&mut renderer, state, dimensions)
+    })
+    .await?;
     Ok(Flow::Exit)
 }
 
@@ -306,10 +317,50 @@ enum TerminalAction {
     Help,
 }
 
+#[derive(Default)]
+struct TerminalInput {
+    bytes: Vec<u8>,
+    buttons: crate::mouse::Buttons,
+}
+impl TerminalInput {
+    async fn mouse(
+        &mut self,
+        mouse: crate::mouse::Mouse,
+        target: &Target,
+        control: &mut protocol::Control,
+    ) -> Result<()> {
+        send_input(&mut self.bytes, target, control).await?;
+        send_mouse(mouse, target, control).await?;
+        self.buttons.record(mouse);
+        Ok(())
+    }
+    async fn release(&mut self, target: &Target, control: &mut protocol::Control) -> Result<()> {
+        send_input(&mut self.bytes, target, control).await?;
+        for mouse in self.buttons.releases() {
+            send_mouse(mouse, target, control).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn send_mouse(
+    mouse: crate::mouse::Mouse,
+    target: &Target,
+    control: &mut protocol::Control,
+) -> Result<()> {
+    control
+        .call(
+            "block.event",
+            json!({"session_id":target.session,"block_id":target.block,"event":mouse.event()}),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn terminal_events(
     events: Vec<shortcuts::Event>,
     keys: &mut shortcuts::Matcher,
-    input: &mut Vec<u8>,
+    input: &mut TerminalInput,
     target: &Target,
     control: &mut protocol::Control,
     tty: &mut tty::Input,
@@ -317,10 +368,15 @@ async fn terminal_events(
     let mut events = events.into_iter();
     while let Some(event) = events.next() {
         match event {
-            shortcuts::Event::Raw(bytes) => input.extend(bytes),
-            shortcuts::Event::Action(action, _) if action == "client.send_prefix" => input.push(2),
+            shortcuts::Event::Mouse(mouse) => {
+                input.mouse(mouse, target, control).await?;
+            }
+            shortcuts::Event::Raw(bytes) => input.bytes.extend(bytes),
+            shortcuts::Event::Action(action, _) if action == "client.send_prefix" => {
+                input.bytes.push(2)
+            }
             shortcuts::Event::Action(action, _) => {
-                send_input(input, target, control).await?;
+                input.release(target, control).await?;
                 let flow = if action == "client.shortcuts" {
                     TerminalAction::Help
                 } else if action == "client.detach" {
@@ -337,7 +393,7 @@ async fn terminal_events(
             }
         }
     }
-    send_input(input, target, control).await?;
+    send_input(&mut input.bytes, target, control).await?;
     Ok(None)
 }
 async fn send_input(
@@ -372,6 +428,64 @@ mod attach_tests {
         WebSocketStream,
         tungstenite::{Message, protocol::Role},
     };
+
+    #[tokio::test]
+    async fn mouse_rpc_order_preserves_text_and_releases_without_replay() -> Result<()> {
+        let (mut control, mut server) = crate::test_support::control_pair().await?;
+        let target = Target {
+            session: "s".into(),
+            block: "b".into(),
+        };
+        let press = crate::mouse::Mouse::parse(b"\x1b[<0;110;5M").unwrap();
+        let serve = async {
+            for (method, value, fail) in [
+                (
+                    "com.superlogical.terminal.write",
+                    json!({"args":{"data":"before"}}),
+                    false,
+                ),
+                ("block.event", json!({"event":press.event()}), false),
+                (
+                    "block.event",
+                    json!({"event":crate::mouse::Mouse { release: true, ..press }.event()}),
+                    false,
+                ),
+                (
+                    "com.superlogical.terminal.write",
+                    json!({"args":{"data":"after"}}),
+                    false,
+                ),
+                ("block.event", json!({"event":press.event()}), true),
+            ] {
+                let request = protocol::next_json(&mut server).await?;
+                assert_eq!(request["method"], method);
+                let field = if method == "block.event" {
+                    "event"
+                } else {
+                    "args"
+                };
+                assert_eq!(request["payload"][field], value[field]);
+                crate::test_support::reply(&mut server, &request, json!({}), fail).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let client = async {
+            let mut input = TerminalInput::default();
+            input.bytes.extend(b"before");
+            input.mouse(press, &target, &mut control).await?;
+            input.release(&target, &mut control).await?;
+            input.bytes.extend(b"after");
+            input.release(&target, &mut control).await?;
+            assert!(input.mouse(press, &target, &mut control).await.is_err());
+            assert!(
+                input.buttons.releases().is_empty(),
+                "failed input must never be replayed"
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(serve, client)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn interactive_attach_focuses_placed_blocks_and_cleans_up_failures() -> Result<()> {

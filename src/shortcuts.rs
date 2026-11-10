@@ -249,11 +249,14 @@ fn modified_key(key: &str) -> Result<Vec<Vec<u8>>> {
 pub enum Event {
     Raw(Vec<u8>),
     Action(Action, Vec<u8>),
+    Mouse(crate::mouse::Mouse),
 }
 impl Event {
     pub fn bytes(self) -> Vec<u8> {
         match self {
             Self::Raw(b) | Self::Action(_, b) => b,
+            // Mouse input belongs to the screen where it was received.
+            Self::Mouse(_) => vec![],
         }
     }
 }
@@ -262,6 +265,7 @@ pub struct Matcher {
     buffer: Vec<u8>,
     pending: Vec<u8>,
     paste: bool,
+    discard_mouse: bool,
 }
 impl Matcher {
     pub fn new(bindings: &Bindings) -> Self {
@@ -270,10 +274,14 @@ impl Matcher {
             buffer: vec![],
             pending: vec![],
             paste: false,
+            discard_mouse: false,
         }
     }
     pub fn remaining(&mut self) -> Vec<u8> {
         let mut rest = std::mem::take(&mut self.pending);
+        if self.buffer.starts_with(b"\x1b[<") || self.buffer.starts_with(b"\x1b[M") {
+            self.buffer.clear();
+        }
         rest.append(&mut self.buffer);
         rest
     }
@@ -286,6 +294,15 @@ impl Matcher {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
         self.buffer.extend_from_slice(bytes);
         let mut events = vec![];
+        if self.discard_mouse {
+            if let Some(end) = self.buffer.iter().position(|b| (0x40..=0x7e).contains(b)) {
+                self.buffer.drain(..=end);
+                self.discard_mouse = false;
+            } else {
+                self.buffer.clear();
+                return events;
+            }
+        }
         while let Some(n) = token_len(&self.buffer) {
             let token: Vec<_> = self.buffer.drain(..n).collect();
             if token == b"\x1b[200~" {
@@ -297,6 +314,13 @@ impl Matcher {
                     self.paste = false;
                 }
                 events.push(Event::Raw(token));
+                continue;
+            }
+            if token.starts_with(b"\x1b[<") || token.starts_with(b"\x1b[M") {
+                self.flush(&mut events);
+                if let Some(mouse) = crate::mouse::Mouse::parse(&token) {
+                    events.push(Event::Mouse(mouse));
+                }
                 continue;
             }
             self.pending.extend_from_slice(&token);
@@ -317,6 +341,10 @@ impl Matcher {
                 }
             }
         }
+        if !self.paste && self.buffer.starts_with(b"\x1b[<") && self.buffer.len() > 64 {
+            self.buffer.clear();
+            self.discard_mouse = true;
+        }
         events
     }
     fn flush(&mut self, events: &mut Vec<Event>) {
@@ -325,6 +353,12 @@ impl Matcher {
         }
     }
     pub fn timeout(&mut self) -> Vec<Event> {
+        // Keep a partial report isolated even if its next fragment arrives late.
+        if self.buffer.starts_with(b"\x1b[<") || self.buffer.starts_with(b"\x1b[M") {
+            let mut events = vec![];
+            self.flush(&mut events);
+            return events;
+        }
         self.pending.append(&mut self.buffer);
         let mut events = vec![];
         if let Some((_, action)) = self
@@ -345,6 +379,9 @@ fn token_len(bytes: &[u8]) -> Option<usize> {
     if first == 27 {
         let &second = bytes.get(1)?;
         if second == b'[' {
+            if bytes.get(2) == Some(&b'M') {
+                return (bytes.len() >= 6).then_some(6);
+            }
             return bytes
                 .iter()
                 .enumerate()
@@ -372,6 +409,44 @@ fn token_len(bytes: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_reports_are_atomic_and_never_match_keyboard_shortcuts() {
+        let config = Config::parse(Value::Null).unwrap();
+        for report in [b"\x1b[<0;120;37M".as_slice(), b"\x1b[M qq"] {
+            for split in 1..report.len() {
+                let mut keys = Matcher::new(&config.browser);
+                assert!(keys.feed(&report[..split]).is_empty());
+                if split >= 3 {
+                    assert!(keys.timeout().is_empty());
+                }
+                assert!(matches!(
+                    keys.feed(&report[split..]).as_slice(),
+                    [Event::Mouse(_)]
+                ));
+            }
+        }
+        let mut keys = Matcher::new(&config.browser);
+        assert!(keys.feed(b"\x1b[<0;").is_empty());
+        assert!(keys.remaining().is_empty());
+        let mut report = b"\x1b[<".to_vec();
+        report.extend(vec![b'1'; 100]);
+        assert!(keys.feed(&report).is_empty());
+        assert!(keys.buffer.is_empty());
+        assert!(keys.feed(b"23;1;1M").is_empty());
+        assert!(matches!(keys.feed(b"q").as_slice(), [Event::Action(_, _)]));
+        let mut keys = Matcher::new(&config.terminal);
+        let paste = b"\x1b[200~\x1b[<0;1;1M\x1b[201~";
+        let events = keys.feed(paste);
+        assert!(events.iter().all(|e| matches!(e, Event::Raw(_))));
+        assert_eq!(
+            events
+                .into_iter()
+                .flat_map(Event::bytes)
+                .collect::<Vec<_>>(),
+            paste
+        );
+    }
+
     #[test]
     fn browser_quits_with_q_and_terminal_uses_one_prefix() {
         let config = Config::parse(Value::Null).unwrap();

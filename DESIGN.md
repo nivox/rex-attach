@@ -163,12 +163,37 @@ with `O_NONBLOCK` and Tokio readiness; it does not set nonblocking mode on the
 shared stdin/stdout file description. Ratatui does not run a competing input
 reader or terminal setup. Browser/help rendering avoids cursor-position queries.
 
-Input is a byte stream, not semantic `block.event` keyboard events. Unbound input
+Keyboard input is a byte stream, not semantic `block.event` keyboard events. Unbound input
 and bracketed paste pass through `com.superlogical.terminal.write` as UTF-8;
 partial UTF-8 characters wait for completion and invalid UTF-8 fails. There is no
 application cursor/keypad or terminal keyboard protocol translation. Ctrl-C,
 Ctrl-D and Ctrl-Z typed in raw mode go to the remote program. External SIGINT and
 SIGTERM request exit through the normal cleanup path.
+
+Mouse reports are decoded before shortcut matching. The outer terminal uses SGR
+cell reports, with press/release, drag, or all-motion tracking according to the
+active UI and remote modes. Scoped TTY guards disable mouse reporting on exit;
+attached help temporarily uses press/release tracking and restores the remote
+tracking level on close. There is still only one TTY input reader.
+
+Application mouse and wheel events use ordered `block.event` RPCs, after flushing
+preceding text input. Rex encodes events using its authoritative terminal modes,
+so legacy binary reports do not pass through the UTF-8 text writer. Coordinates
+outside the displayed remote grid are ignored. Without application tracking,
+vertical wheel events scroll Ghostty's local primary-screen history, or generate
+cursor keys if the remote alternate screen has alternate-scroll mode enabled.
+Keyboard input restores the live viewport. Mouse events received for a screen
+are discarded rather than replayed across attachment/navigation transitions.
+Successful presses are tracked per attachment; held buttons are released on the
+old target before entering help, navigating, detaching, or exiting normally.
+
+Browser clicks use the rectangles and list offsets captured by the last draw;
+single clicks select, double clicks choose, and wheel events navigate the pointed
+column. Dialogs absorb mouse input; help handles wheel scrolling locally. Mouse
+transitions return the same effects as keyboard transitions. The input decoder
+accepts SGR and legacy X10 cell reports; extra buttons beyond the standard three
+buttons and wheel are ignored. Pixel reports and a local text-selection UI are
+not implemented; use the outer terminal's selection override.
 
 Shortcut matching preserves fragmented escapes, bracketed-paste isolation and
 unmatched bytes. It buffers chord sequences with a one-second prefix timeout
@@ -305,6 +330,7 @@ python3 scripts/live-smoke.py --socket /path/to/rex.sock --mode all --multi-bloc
 python3 scripts/live-smoke.py --socket /path/to/rex.sock --mode session --multi-block-tab --preview-mode auto --kitty-terminal
 python3 scripts/ownership-smoke.py --socket /path/to/rex.sock
 python3 scripts/shortcuts-smoke.py --socket /path/to/rex.sock
+python3 scripts/mouse-smoke.py --socket /path/to/rex.sock
 python3 scripts/activity-smoke.py --socket /path/to/rex.sock
 ```
 
@@ -314,14 +340,16 @@ navigation, preview size/ownership invariants, and terminal restoration.
 updates and deletion; it is not a real emulator GUI test. `--preview-font` selects
 an explicit font and `--image-out /tmp/preview.png` saves decoded pixels. Ownership
 smoke exercises simultaneous clients and resize/release; shortcut smoke covers
-management, navigation, config overrides and modal help; activity smoke covers
+management, navigation, config overrides and modal help; mouse smoke covers both
+renderers, browser activation, SGR/legacy/fragmented reports, held-button cleanup,
+help isolation, local history, resize and exit cleanup; activity smoke covers
 metadata, status changes/clearing and parent aggregation. These checks provide
 bounded evidence, not a guarantee of arbitrary terminal compatibility.
 
 ## Unimplemented capabilities
 
-Automatic reconnect/data resume, semantic keyboard/paste events, mouse/focus
-forwarding, a local scrollback UI, embedded terminal graphics and clipboard
+Automatic reconnect/data resume, semantic keyboard/paste events, focus
+forwarding, scrollback search, embedded terminal graphics and clipboard
 integration remain outside the implementation. There is no guarantee of color
 fallback or translation between differing keyboard protocols. Live theme and
 process-exit metadata presentation are also unimplemented.

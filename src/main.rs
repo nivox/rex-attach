@@ -3,6 +3,7 @@ mod actions;
 mod activity;
 mod browser;
 mod help;
+mod mouse;
 mod preview;
 mod protocol;
 mod raster;
