@@ -65,7 +65,9 @@ impl State {
             match part {
                 Part::Output(bytes) => terminal.vt_write(&bytes),
                 Part::Metadata(value) => {
-                    if value["type"] == "resize" {
+                    if value["type"] == "theme" {
+                        serde_json::from_value::<crate::theme::Theme>(value)?.apply(terminal)?;
+                    } else if value["type"] == "resize" {
                         let cols = value["cols"]
                             .as_u64()
                             .filter(|n| (1..=65535).contains(n))
@@ -508,6 +510,37 @@ mod tests {
                 "update {update:?}"
             );
             assert!(renderer.frame(&source, 12, 3)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rex_theme_records_repaint_existing_cells_on_both_backends() -> Result<()> {
+        for backend in [Backend::Ansi, Backend::Ratatui] {
+            let mut source = Terminal::new(TerminalOptions::default())?;
+            source.vt_write(b"default \x1b[31mindexed\x1b[0m");
+            let mut state = State::new(1);
+            state.feed(&snapshot::encode(&source)?)?;
+            let mut renderer = super::Renderer::new(backend)?;
+            renderer.frame(state.terminal()?, 20, 4)?;
+
+            state.feed(b"\x1b_rex1;1;{\"type\":\"theme\",\"foreground\":\"#aabbcc\",\"palette\":[\"1=#112233\"]}\x1b\\")?;
+            let recolored = renderer.frame(state.terminal()?, 20, 4)?;
+            assert!(
+                recolored.contains("38;2;170;187;204"),
+                "{backend:?}: {recolored:?}"
+            );
+            assert!(
+                recolored.contains("38;2;17;34;51"),
+                "{backend:?}: {recolored:?}"
+            );
+            assert!(renderer.frame(state.terminal()?, 20, 4)?.is_empty());
+
+            state.feed(b"\x1b_rex1;1;{\"type\":\"theme\",\"palette\":null}\x1b\\")?;
+            let reset = renderer.frame(state.terminal()?, 20, 4)?;
+            assert!(!reset.is_empty());
+            assert!(!reset.contains("38;2;17;34;51"));
+            assert!(reset.contains("38;2;255;255;255"));
         }
         Ok(())
     }

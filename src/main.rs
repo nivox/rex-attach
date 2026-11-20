@@ -11,6 +11,7 @@ mod raster;
 mod shortcuts;
 mod stream;
 mod terminal;
+mod theme;
 mod tty;
 mod vt;
 mod wire;

@@ -133,6 +133,11 @@ they leave ownership, size, and focus unchanged. To print the initial screen:
 rex-attach --socket /path/to/rex.sock --session work --block shell --capture
 ```
 
+Interactive attachment applies your terminal's reported colors to the shared Rex
+block by default. The terminal must report both its default foreground and
+background. Rex uses its built-in colors for any cursor color or palette entries
+the terminal doesn't report.
+
 Mouse clicks select browser rows; double-click chooses a row, and the wheel
 navigates the column under the pointer or scrolls shortcut help. Attached programs
 receive mouse input when they request it. Otherwise, the wheel scrolls local
@@ -194,6 +199,12 @@ defaults to `/run/rex/server.sock`. Custom service socket paths need `--socket`
 or `REX_SERVER`. The Rex CLI is not required or invoked, and rex-attach does not
 launch a server itself. Connecting to a socket managed by systemd can activate
 its service.
+
+### Theme inheritance
+
+Set `"inherit_theme": false` in `config.json` to keep the Rex block's theme on
+attach. The default is `true`. Use `--inherit-theme` or `--no-inherit-theme` to
+override the setting for one invocation.
 
 ### Shortcuts and previews
 

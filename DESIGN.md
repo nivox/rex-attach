@@ -113,11 +113,14 @@ it waits for completion before reporting the error, preserving control ordering.
 4. Capture prints the restored viewport as plain text and releases the session.
    Interactive mode calls `session.own_block` with mode `take` after restoration,
    then submits the outer terminal's columns/rows through
-   `com.superlogical.terminal.resize`.
+   `com.superlogical.terminal.resize`. Theme inheritance is enabled by default.
+   When enabled, startup queries the outer terminal and attach submits the
+   reported colors with `com.superlogical.terminal.set_theme` after taking ownership.
 5. Feed live VT bytes into Ghostty. The incremental parser extracts only Rex APC
    records matching the channel nonce, preserves partial prefixes across messages,
    and limits a metadata record to 1 MiB. Resize metadata is applied in stream
-   order. Live theme metadata and process-exit notices are currently ignored.
+   order, as are theme records that update the emulator's default colors.
+   Process-exit notices are currently ignored.
 
 The restored snapshot and ordered stream are authoritative. A requested resize
 does not optimistically reflow the local emulator; the server's resize record
@@ -467,5 +470,5 @@ bounded evidence, not a guarantee of arbitrary terminal compatibility.
 Automatic reconnect/data resume, semantic keyboard/paste events, focus
 forwarding, scrollback search, animated images, non-Kitty image protocols and clipboard
 integration remain outside the implementation. There is no guarantee of color
-fallback or translation between differing keyboard protocols. Live theme and
-process-exit metadata presentation are also unimplemented.
+fallback or translation between differing keyboard protocols. Process-exit
+metadata presentation is also unimplemented.

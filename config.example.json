@@ -1,4 +1,5 @@
 {
+  "inherit_theme": true,
   "preview_layout": "row",
   "shortcuts": {
     "browser": {

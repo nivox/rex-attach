@@ -118,6 +118,26 @@ impl Terminal {
         // SAFETY: the input slice is valid for the synchronous native call.
         unsafe { ffi::ghostty_terminal_vt_write(self.raw(), bytes.as_ptr(), bytes.len()) };
     }
+    pub fn set_theme(
+        &mut self,
+        foreground: style::RgbColor,
+        background: style::RgbColor,
+        cursor: Option<style::RgbColor>,
+        palette: style::Palette,
+    ) -> Result<()> {
+        for (tag, color) in [
+            (ffi::TerminalOption::COLOR_FOREGROUND, Some(foreground)),
+            (ffi::TerminalOption::COLOR_BACKGROUND, Some(background)),
+            (ffi::TerminalOption::COLOR_CURSOR, cursor),
+        ] {
+            let color = color.map(ffi::ColorRgb::from);
+            let value = color.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+            // SAFETY: these setters copy a ColorRgb or clear the default on null.
+            check(unsafe { ffi::ghostty_terminal_set(self.raw(), tag, value.cast()) })?;
+        }
+        let palette: [ffi::ColorRgb; 256] = palette.into();
+        self.set(ffi::TerminalOption::COLOR_PALETTE, &palette)
+    }
     pub fn resize(&mut self, cols: u16, rows: u16, width: u32, height: u32) -> Result<()> {
         // SAFETY: uniquely borrowed live terminal, scalar geometry.
         check(unsafe { ffi::ghostty_terminal_resize(self.raw(), cols, rows, width, height) })

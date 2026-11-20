@@ -1,4 +1,4 @@
-use crate::{domain::Target, protocol::Control, stream, terminal};
+use crate::{domain::Target, protocol::Control, stream, terminal, theme};
 use anyhow::{Context, Result};
 use ratatui_image::{
     picker::{
@@ -119,6 +119,7 @@ struct Probe {
     compress: bool,
     font: Option<(u16, u16)>,
     done: bool,
+    theme: Option<theme::Probe>,
 }
 impl Probe {
     fn feed(&mut self, bytes: &[u8]) {
@@ -138,6 +139,28 @@ impl Probe {
         self.sequence.push(byte);
         let csi = self.sequence.starts_with(b"\x1b[");
         let apc = self.sequence.starts_with(b"\x1b_G");
+        let osc = self.theme.is_some() && self.sequence.starts_with(b"\x1b]");
+        if osc {
+            let body = &self.sequence[2..];
+            let end = if byte == b'\x07' {
+                1
+            } else if self.sequence.ends_with(b"\x1b\\") {
+                2
+            } else {
+                0
+            };
+            if end > 0 {
+                let reply = &body[..body.len() - end];
+                if self.theme.as_mut().is_some_and(|theme| theme.reply(reply)) {
+                    self.sequence.clear();
+                } else {
+                    self.keys.append(&mut self.sequence);
+                }
+            } else if body.len() > 62 || !theme::reply_prefix(body) {
+                self.keys.append(&mut self.sequence);
+            }
+            return;
+        }
         let finished = (csi && self.sequence.len() > 2 && (0x40..=0x7e).contains(&byte))
             || (apc && self.sequence.ends_with(b"\x1b\\"));
         if finished {
@@ -168,20 +191,39 @@ impl Probe {
         }
     }
 }
-pub(crate) async fn probe(input: &mut crate::tty::Input) -> Result<Option<Graphics>> {
+pub(crate) async fn probe(
+    input: &mut crate::tty::Input,
+    graphics: bool,
+    inherit_theme: bool,
+) -> Result<(Option<Graphics>, Option<theme::Theme>)> {
     use std::io::Write;
+    if !graphics && !inherit_theme {
+        return Ok((None, None));
+    }
     let tmux = std::env::var_os("TMUX").is_some();
-    let query = Parser::query(
-        tmux,
-        QueryStdioOptions {
-            kitty_compression: true,
-            blacklist_protocols: vec![ProtocolType::Sixel],
-            ..Default::default()
-        },
-    );
+    let mut query = String::new();
+    if inherit_theme {
+        theme::append_queries(&mut query);
+    }
+    if graphics {
+        query.push_str(&Parser::query(
+            tmux,
+            QueryStdioOptions {
+                kitty_compression: true,
+                blacklist_protocols: vec![ProtocolType::Sixel],
+                ..Default::default()
+            },
+        ));
+    } else {
+        // The status reply marks the end of the terminal's color replies.
+        query.push_str("\x1b[5n");
+    }
     std::io::stdout().write_all(query.as_bytes())?;
     std::io::stdout().flush()?;
-    let mut probe = Probe::default();
+    let mut probe = Probe {
+        theme: inherit_theme.then(theme::Probe::default),
+        ..Default::default()
+    };
     let mut bytes = [0u8; 1024];
     let timeout = tokio::time::sleep(Duration::from_millis(500));
     tokio::pin!(timeout);
@@ -195,11 +237,14 @@ pub(crate) async fn probe(input: &mut crate::tty::Input) -> Result<Option<Graphi
         probe.keys.append(&mut probe.sequence);
     }
     input.unread(&probe.keys);
-    Ok(probe.kitty.then(|| Graphics {
-        font: probe.font.unwrap_or((10, 20)).into(),
-        tmux,
-        compress: probe.compress,
-    }))
+    Ok((
+        (graphics && probe.kitty).then(|| Graphics {
+            font: probe.font.unwrap_or((10, 20)).into(),
+            tmux,
+            compress: probe.compress,
+        }),
+        probe.theme.and_then(theme::Probe::finish),
+    ))
 }
 
 pub struct RenderedImage {
@@ -385,6 +430,32 @@ mod tests {
         assert!(!probe.kitty);
         assert!(probe.keys.is_empty());
         assert!(probe.done);
+    }
+    #[test]
+    fn probe_collects_color_replies_without_consuming_other_input() {
+        let data = b"j\x1b]10;rgb:ffff/abcd/0000\x1b\\\x1b[B\x1b]11;#112233\x07\x1b]12;rgb:0/8/f\x07\x1b]4;255;rgb:12/34/56\x1b\\\x1b]9;other\x07\x1b[0nl";
+        for split in 0..=data.len() {
+            let mut probe = Probe {
+                theme: Some(theme::Probe::default()),
+                ..Default::default()
+            };
+            probe.feed(&data[..split]);
+            probe.feed(&data[split..]);
+            assert!(probe.done);
+            assert_eq!(probe.keys, b"j\x1b[B\x1b]9;other\x07l");
+            let theme = probe.theme.unwrap().finish().unwrap();
+            assert_eq!(
+                serde_json::to_value(theme).unwrap(),
+                serde_json::json!({
+                    "foreground":"#ffab00", "background":"#112233", "cursor":"#0088ff",
+                    "palette":["255=#123456"]
+                })
+            );
+        }
+        let mut probe = theme::Probe::default();
+        assert!(!probe.reply(b"10;rgb:ffff/not-rgb/0000"));
+        assert!(probe.reply(b"11;#112233"));
+        assert!(probe.finish().is_none());
     }
     #[test]
     fn kitty_widget_transmits_pixels_once_and_deletes_only_its_image() -> Result<()> {

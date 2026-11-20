@@ -28,6 +28,7 @@ pub struct Bindings {
     pub display: Vec<(String, Action)>,
 }
 pub struct Config {
+    pub inherit_theme: bool,
     pub preview_layout: crate::browser::PreviewLayout,
     pub browser: Bindings,
     pub terminal: Bindings,
@@ -93,6 +94,15 @@ impl Config {
             }
         }
         Ok(Self {
+            inherit_theme: value
+                .get("inherit_theme")
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .context("inherit_theme must be true or false")
+                })
+                .transpose()?
+                .unwrap_or(true),
             preview_layout: value
                 .get("preview_layout")
                 .cloned()

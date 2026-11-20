@@ -1,6 +1,6 @@
 use crate::{
     actions, browser, domain::Target, help, preview, protocol, session::resize, shortcuts, stream,
-    terminal, tty,
+    terminal, theme, tty,
 };
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
@@ -26,6 +26,12 @@ struct Args {
     /// Attached terminal renderer.
     #[arg(long, value_enum, default_value = "ansi")]
     renderer: terminal::Backend,
+    /// Apply the outer terminal's reported colors to the shared Rex block on attach.
+    #[arg(long, conflicts_with_all = ["capture", "no_inherit_theme"])]
+    inherit_theme: bool,
+    /// Keep the Rex block's theme when attaching.
+    #[arg(long)]
+    no_inherit_theme: bool,
     /// Embedded terminal images: detect Kitty support, force Kitty, or disable.
     #[arg(long, value_enum, default_value = "auto")]
     images: crate::graphics::output::Mode,
@@ -43,11 +49,18 @@ struct Args {
     preview_font: Option<std::path::PathBuf>,
 }
 
+impl Args {
+    fn inherits_theme(&self, configured: bool) -> bool {
+        self.inherit_theme || (configured && !self.no_inherit_theme)
+    }
+}
+
 struct Config {
     args: Args,
     socket: String,
     shortcuts: shortcuts::Config,
     graphics: Option<[u32; 2]>,
+    theme: Option<theme::Theme>,
 }
 impl std::ops::Deref for Config {
     type Target = Args;
@@ -76,6 +89,7 @@ pub async fn run() -> Result<()> {
         socket,
         shortcuts,
         graphics: None,
+        theme: None,
     };
     let scope = if let Some(session) = &args.session {
         Some(control.resolve_session(session).await?)
@@ -97,13 +111,11 @@ pub async fn run() -> Result<()> {
     }
     let _guard = tty::Guard::enter().context("entering terminal mode")?;
     let mut input = tty::Input::open().context("opening terminal input")?;
-    let detected = if matches!(args.images, crate::graphics::output::Mode::Off)
-        && matches!(args.preview, preview::Mode::Text)
-    {
-        None
-    } else {
-        preview::probe(&mut input).await?
-    };
+    let detect_graphics = !matches!(args.images, crate::graphics::output::Mode::Off)
+        || !matches!(args.preview, preview::Mode::Text);
+    let inherit_theme = args.inherits_theme(args.shortcuts.inherit_theme);
+    let (detected, theme) = preview::probe(&mut input, detect_graphics, inherit_theme).await?;
+    args.theme = theme;
     if let Some(g) = &detected {
         tty::set_cell_pixels(g.font.width, g.font.height);
     }
@@ -223,6 +235,14 @@ async fn attach_inner(
             json!({"session_id":target.session,"block_ids":[target.block],"mode":"take"}),
         )
         .await?;
+    if let Some(theme) = &args.theme {
+        control
+            .call(
+                "com.superlogical.terminal.set_theme",
+                json!({"session_id":target.session,"block_id":target.block,"args":theme}),
+            )
+            .await?;
+    }
     interactive(
         target,
         control,
@@ -463,6 +483,30 @@ mod attach_tests {
         tungstenite::{Message, protocol::Role},
     };
 
+    #[test]
+    fn theme_inheritance_defaults_on_and_cli_overrides_the_config() -> Result<()> {
+        let default = shortcuts::Config::parse(json!({}))?;
+        let enabled = shortcuts::Config::parse(json!({"inherit_theme": true}))?;
+        let disabled = shortcuts::Config::parse(json!({"inherit_theme": false}))?;
+        let args = Args::try_parse_from(["rex-attach"])?;
+        assert!(args.inherits_theme(default.inherit_theme));
+        assert!(args.inherits_theme(enabled.inherit_theme));
+        assert!(!args.inherits_theme(disabled.inherit_theme));
+        assert!(
+            Args::try_parse_from(["rex-attach", "--inherit-theme"])?
+                .inherits_theme(disabled.inherit_theme)
+        );
+        assert!(
+            !Args::try_parse_from(["rex-attach", "--no-inherit-theme"])?
+                .inherits_theme(enabled.inherit_theme)
+        );
+        assert!(
+            Args::try_parse_from(["rex-attach", "--no-inherit-theme", "--inherit-theme"]).is_err()
+        );
+        assert!(shortcuts::Config::parse(json!({"inherit_theme": "false"})).is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn mouse_rpc_order_preserves_text_and_releases_without_replay() -> Result<()> {
         let (mut control, mut server) = crate::test_support::control_pair().await?;
@@ -571,6 +615,7 @@ mod attach_tests {
                     socket: "/unused".into(),
                     shortcuts: shortcuts::Config::load()?,
                     graphics: None,
+                    theme: None,
                 };
                 let target = Target {
                     session: "session:test".into(),
