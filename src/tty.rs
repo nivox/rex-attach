@@ -100,14 +100,14 @@ impl Guard {
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        io::stdout().write_all(b"\x1b[?1049h\x1b[?7l")?;
+        io::stdout().write_all(b"\x1b[?1049h\x1b[?7l\x1b[22;0t")?;
         io::stdout().flush()?;
         Ok(guard)
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        let _ = io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2026l\x1b[0m\x1b[?7h\x1b[0 q\x1b[?25h\x1b[?1049l");
+        let _ = io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2026l\x1b[0m\x1b[?7h\x1b[0 q\x1b[?25h\x1b[23;0t\x1b[?1049l");
         let _ = io::stdout().flush();
         // SAFETY: restore the saved terminal attributes.
         unsafe {
@@ -117,6 +117,12 @@ impl Drop for Guard {
 }
 
 /// The outer TTY reports SGR cells; Rex owns the remote application's encoding.
+pub fn restore_title() -> io::Result<()> {
+    let mut out = io::stdout();
+    out.write_all(b"\x1b[23;0t\x1b[22;0t")?;
+    out.flush()
+}
+
 pub struct MouseGuard(Option<u16>);
 impl MouseGuard {
     pub fn enter(motion: bool) -> io::Result<Self> {

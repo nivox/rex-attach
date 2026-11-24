@@ -76,7 +76,8 @@ impl Renderer {
             if !all && !row.dirty()? {
                 continue;
             }
-            self.painter.paint(row, &defaults, width)?;
+            self.painter
+                .paint(terminal, row, &defaults, width, index as u16)?;
             if reset || self.lines[index] != self.painter.line.scratch {
                 write!(body, "\x1b[{};1H{}", index + 1, self.painter.line.scratch)?;
                 std::mem::swap(&mut self.lines[index], &mut self.painter.line.scratch);
@@ -107,12 +108,15 @@ impl RowPainter {
     }
     fn paint(
         &mut self,
+        terminal: &Terminal,
         row: &crate::vt::render::RowIteration<'_>,
         defaults: &crate::vt::render::Colors,
         width: u16,
+        y: u16,
     ) -> Result<()> {
         self.line.scratch.clear();
         self.line.active_style = None;
+        self.line.active_link = None;
         let mut cells = self.cells.update(row)?;
         let mut x = 0;
         while let Some(cell) = cells.next() {
@@ -121,8 +125,10 @@ impl RowPainter {
             }
             let at = x;
             x += 1;
-            self.line.paint(cell, defaults, width - at)?;
+            self.line
+                .paint(terminal, cell, defaults, width - at, at, y)?;
         }
+        self.line.set_link(None);
         Ok(())
     }
 }
@@ -156,20 +162,46 @@ struct Line {
     scratch: String,
     text: String,
     active_style: Option<StyleKey>,
+    active_link: Option<String>,
 }
 impl Line {
+    fn set_link(&mut self, uri: Option<&str>) {
+        let clean = uri.map(|u| u.chars().filter(|c| !c.is_control()).collect::<String>());
+        if self.active_link == clean {
+            return;
+        }
+        match &clean {
+            Some(uri) => {
+                self.scratch.push_str("\x1b]8;;");
+                self.scratch.push_str(uri);
+                self.scratch.push_str("\x1b\\");
+            }
+            None => self.scratch.push_str("\x1b]8;;\x1b\\"),
+        }
+        self.active_link = clean;
+    }
     fn paint(
         &mut self,
+        terminal: &Terminal,
         cell: &crate::vt::render::CellIteration<'_>,
         defaults: &crate::vt::render::Colors,
         visible_width: u16,
+        x: u16,
+        y: u16,
     ) -> Result<()> {
         use crate::vt::screen::CellWide;
         use std::fmt::Write;
-        let wide = cell.raw_cell()?.wide()?;
+        let raw = cell.raw_cell()?;
+        let wide = raw.wide()?;
         if wide == CellWide::SpacerTail {
             return Ok(());
         }
+        let link = if raw.has_hyperlink()? {
+            terminal.hyperlink_uri(x, y)?
+        } else {
+            None
+        };
+        self.set_link(link.as_deref());
         let style = cell.style()?;
         let mut fg = cell.fg_color()?.unwrap_or(defaults.foreground);
         let mut bg = cell.bg_color()?.unwrap_or(defaults.background);

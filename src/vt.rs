@@ -75,7 +75,7 @@ unsafe fn query<T>(read: impl FnOnce(*mut c_void) -> ffi::Result::Type) -> Resul
 pub struct Terminal {
     // The native handle must drop before the queue its userdata points at.
     handle: Owned<ffi::TerminalImpl>,
-    clipboard: Option<Box<std::cell::RefCell<Vec<ClipboardWrite>>>>,
+    events: Option<Box<std::cell::RefCell<Vec<Event>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +103,21 @@ impl ClipboardWrite {
     }
 }
 const CLIPBOARD_LIMIT: usize = 1024 * 1024;
+const HYPERLINK_LIMIT: usize = 8192;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Clipboard(ClipboardWrite),
+    Bell,
+    TitleChanged,
+    PwdChanged,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Forward {
+    pub clipboard: bool,
+    pub title: bool,
+}
 macro_rules! terminal_values {
     ($($name:ident:$ty:ty=>$tag:ident),*$(,)?)=>{$(
         pub fn $name(&self)->Result<$ty> {
@@ -124,7 +139,7 @@ impl Terminal {
                 },
                 ffi::ghostty_terminal_free,
             )?,
-            clipboard: None,
+            events: None,
         };
         result.set(
             ffi::TerminalOption::SCROLLBACK_MAX_BYTES,
@@ -136,45 +151,137 @@ impl Terminal {
         };
         result.set(ffi::TerminalOption::MODE_DEFAULT, &mode)?;
         // No input/query callbacks are installed: Rex alone answers the program.
-        // Clipboard writes are opt-in through enable_clipboard_writes.
+        // Event forwarding is opt-in through enable_events.
         Ok(result)
     }
     pub(crate) fn raw(&self) -> ffi::Terminal {
         self.handle.raw()
     }
-    /// Queue decoded clipboard writes (OSC 52, OSC 1337, OSC 5522) for the caller.
-    pub fn enable_clipboard_writes(&mut self) -> Result<()> {
-        if self.clipboard.is_some() {
+    fn install(&self, tag: ffi::TerminalOption::Type, ptr: *const c_void) -> Result<()> {
+        // SAFETY: callers pass the documented callback/userdata pointer for tag.
+        check(unsafe { ffi::ghostty_terminal_set(self.raw(), tag, ptr) })
+    }
+    /// Queue decoded terminal events (bell, pwd, optional title/clipboard) for the caller.
+    pub fn enable_events(&mut self, forward: Forward) -> Result<()> {
+        if self.events.is_some() {
             return Ok(());
         }
-        let queue: Box<std::cell::RefCell<Vec<ClipboardWrite>>> = Box::default();
+        let queue: Box<std::cell::RefCell<Vec<Event>>> = Box::default();
         let userdata = std::ptr::from_ref(&*queue).cast::<c_void>();
         // SAFETY: the boxed queue has a stable address and outlives the native
-        // handle (field order); both options take the documented pointer types.
-        unsafe {
-            check(ffi::ghostty_terminal_set(
-                self.raw(),
-                ffi::TerminalOption::USERDATA,
-                userdata,
-            ))?;
-            let callback: ffi::TerminalClipboardWriteFn = Some(clipboard_write);
-            check(ffi::ghostty_terminal_set(
-                self.raw(),
-                ffi::TerminalOption::CLIPBOARD_WRITE,
-                callback.map_or(std::ptr::null(), |f| f as *const c_void),
-            ))?;
+        // handle (field order); each option receives its documented callback type.
+        self.install(ffi::TerminalOption::USERDATA, userdata)?;
+        let bell: ffi::TerminalBellFn = Some(on_bell);
+        self.install(
+            ffi::TerminalOption::BELL,
+            bell.map_or(std::ptr::null(), |f| f as *const c_void),
+        )?;
+        let pwd: ffi::TerminalPwdChangedFn = Some(on_pwd_changed);
+        self.install(
+            ffi::TerminalOption::PWD_CHANGED,
+            pwd.map_or(std::ptr::null(), |f| f as *const c_void),
+        )?;
+        if forward.title {
+            let title: ffi::TerminalTitleChangedFn = Some(on_title_changed);
+            self.install(
+                ffi::TerminalOption::TITLE_CHANGED,
+                title.map_or(std::ptr::null(), |f| f as *const c_void),
+            )?;
         }
-        self.clipboard = Some(queue);
-        self.set(
-            ffi::TerminalOption::CLIPBOARD_WRITE_MAX_BYTES,
-            &CLIPBOARD_LIMIT,
-        )
+        if forward.clipboard {
+            let clipboard: ffi::TerminalClipboardWriteFn = Some(clipboard_write);
+            self.install(
+                ffi::TerminalOption::CLIPBOARD_WRITE,
+                clipboard.map_or(std::ptr::null(), |f| f as *const c_void),
+            )?;
+            self.set(
+                ffi::TerminalOption::CLIPBOARD_WRITE_MAX_BYTES,
+                &CLIPBOARD_LIMIT,
+            )?;
+        }
+        self.events = Some(queue);
+        if forward.title && !self.title()?.is_empty() {
+            self.events
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .push(Event::TitleChanged);
+        }
+        if !self.pwd()?.is_empty() {
+            self.events
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .push(Event::PwdChanged);
+        }
+        Ok(())
     }
-    pub fn take_clipboard_writes(&mut self) -> Vec<ClipboardWrite> {
-        self.clipboard
+    pub fn take_events(&mut self) -> Vec<Event> {
+        self.events
             .as_ref()
             .map(|queue| std::mem::take(&mut *queue.borrow_mut()))
             .unwrap_or_default()
+    }
+    fn string(&self, tag: ffi::TerminalData::Type) -> Result<String> {
+        // SAFETY: TITLE/PWD write a borrowed GhosttyString valid until the next mutation.
+        let s: ffi::String =
+            unsafe { query(|out| ffi::ghostty_terminal_get(self.raw(), tag, out)) }?;
+        if s.ptr.is_null() || s.len == 0 {
+            return Ok(String::new());
+        }
+        // SAFETY: non-null GhosttyString points to len valid bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(s.ptr, s.len) };
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+    pub fn title(&self) -> Result<String> {
+        self.string(ffi::TerminalData::TITLE)
+    }
+    pub fn pwd(&self) -> Result<String> {
+        self.string(ffi::TerminalData::PWD)
+    }
+    pub fn hyperlink_uri(&self, x: u16, y: u16) -> Result<Option<String>> {
+        let point = ffi::Point {
+            tag: ffi::PointTag::VIEWPORT,
+            value: ffi::PointValue {
+                coordinate: ffi::PointCoordinate { x, y: u32::from(y) },
+            },
+        };
+        let mut grid_ref = ffi::GridRef {
+            size: size_of::<ffi::GridRef>(),
+            node: std::ptr::null_mut(),
+            x: 0,
+            y: 0,
+        };
+        // SAFETY: grid_ref is sized and valid for this terminal call.
+        if unsafe { ffi::ghostty_terminal_grid_ref(self.raw(), point, &mut grid_ref) }
+            != ffi::Result::SUCCESS
+        {
+            return Ok(None);
+        }
+        let mut len = 0usize;
+        // SAFETY: sizing pass with null buffer writes required length into len.
+        let code = unsafe {
+            ffi::ghostty_grid_ref_hyperlink_uri(&grid_ref, std::ptr::null_mut(), 0, &mut len)
+        };
+        if code == ffi::Result::SUCCESS && len == 0 {
+            return Ok(None);
+        }
+        if (code != ffi::Result::OUT_OF_SPACE && code != ffi::Result::SUCCESS)
+            || len == 0
+            || len > HYPERLINK_LIMIT
+        {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; len];
+        // SAFETY: buf has len bytes of capacity for the URI.
+        let code = unsafe {
+            ffi::ghostty_grid_ref_hyperlink_uri(&grid_ref, buf.as_mut_ptr(), buf.len(), &mut len)
+        };
+        if code != ffi::Result::SUCCESS || len == 0 || len > buf.len() {
+            return Ok(None);
+        }
+        buf.truncate(len);
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
     }
     fn set<T>(&self, tag: ffi::TerminalOption::Type, value: &T) -> Result<()> {
         // SAFETY: private callers provide the C type documented for each tag.
@@ -310,6 +417,34 @@ impl Terminal {
     }
 }
 
+unsafe fn push_event(userdata: *mut c_void, event: Event) -> bool {
+    if userdata.is_null() {
+        return false;
+    }
+    // SAFETY: userdata is the boxed queue installed by enable_events.
+    let queue = unsafe { &*userdata.cast::<std::cell::RefCell<Vec<Event>>>() };
+    let Ok(mut queue) = queue.try_borrow_mut() else {
+        return false;
+    };
+    queue.push(event);
+    true
+}
+
+unsafe extern "C" fn on_bell(_terminal: ffi::Terminal, userdata: *mut c_void) {
+    // SAFETY: userdata is the boxed queue installed by enable_events.
+    let _ = unsafe { push_event(userdata, Event::Bell) };
+}
+
+unsafe extern "C" fn on_title_changed(_terminal: ffi::Terminal, userdata: *mut c_void) {
+    // SAFETY: userdata is the boxed queue installed by enable_events.
+    let _ = unsafe { push_event(userdata, Event::TitleChanged) };
+}
+
+unsafe extern "C" fn on_pwd_changed(_terminal: ffi::Terminal, userdata: *mut c_void) {
+    // SAFETY: userdata is the boxed queue installed by enable_events.
+    let _ = unsafe { push_event(userdata, Event::PwdChanged) };
+}
+
 unsafe extern "C" fn clipboard_write(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
@@ -353,18 +488,19 @@ unsafe extern "C" fn clipboard_write(
         .filter(|data| data.len() <= CLIPBOARD_LIMIT);
     let mut result = ffi::ClipboardWriteResult::UNSUPPORTED;
     if let (Some(location), Some(text)) = (location, text) {
-        // SAFETY: userdata is the boxed queue installed by enable_clipboard_writes.
-        let queue = unsafe { &*userdata.cast::<std::cell::RefCell<Vec<ClipboardWrite>>>() };
-        result = match queue.try_borrow_mut() {
-            Ok(mut queue) => {
-                queue.push(ClipboardWrite {
+        if unsafe {
+            push_event(
+                userdata,
+                Event::Clipboard(ClipboardWrite {
                     location,
                     text: text.to_vec(),
-                });
-                ffi::ClipboardWriteResult::SUCCESS
-            }
-            Err(_) => ffi::ClipboardWriteResult::BUSY,
-        };
+                }),
+            )
+        } {
+            result = ffi::ClipboardWriteResult::SUCCESS;
+        } else {
+            result = ffi::ClipboardWriteResult::BUSY;
+        }
     }
     let reply = ffi::ClipboardWriteReply {
         size: size_of::<ffi::ClipboardWriteReply>(),
@@ -394,17 +530,70 @@ mod tests {
     fn osc52_is_queued_only_when_enabled() {
         let mut off = terminal();
         off.vt_write(b"\x1b]52;c;aGVsbG8=\x1b\\");
-        assert!(off.take_clipboard_writes().is_empty());
+        assert!(off.take_events().is_empty());
 
         let mut on = terminal();
-        on.enable_clipboard_writes().unwrap();
+        on.enable_events(Forward {
+            clipboard: true,
+            title: true,
+        })
+        .unwrap();
         on.vt_write(b"\x1b]52;c;aGVsbG8=\x1b\\\x1b]52;p;aGk=\x07");
-        let writes = on.take_clipboard_writes();
+        let writes: Vec<_> = on
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Clipboard(c) => Some(c),
+                _ => None,
+            })
+            .collect();
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].location, ClipboardLocation::Standard);
         assert_eq!(writes[0].text, b"hello");
         assert_eq!(writes[0].osc52(), "\x1b]52;c;aGVsbG8=\x1b\\");
         assert_eq!(writes[1].location, ClipboardLocation::Primary);
-        assert!(on.take_clipboard_writes().is_empty());
+        assert!(on.take_events().is_empty());
+    }
+
+    #[test]
+    fn bell_title_pwd_and_seeding() {
+        let mut term = terminal();
+        term.vt_write(b"\x1b]2;pre-title\x07");
+        term.enable_events(Forward {
+            clipboard: false,
+            title: true,
+        })
+        .unwrap();
+        assert!(term.take_events().contains(&Event::TitleChanged));
+        assert_eq!(term.title().unwrap(), "pre-title");
+
+        term.vt_write(b"\x1b]2;hello\x07\x07\x1b]7;file://host/tmp\x1b\\");
+        let events = term.take_events();
+        assert!(events.contains(&Event::TitleChanged));
+        assert!(events.contains(&Event::Bell));
+        assert!(events.contains(&Event::PwdChanged));
+        assert_eq!(term.title().unwrap(), "hello");
+        assert!(term.pwd().unwrap().contains("/tmp"));
+
+        let mut no_title = terminal();
+        no_title
+            .enable_events(Forward {
+                clipboard: false,
+                title: false,
+            })
+            .unwrap();
+        no_title.vt_write(b"\x1b]2;ignored\x07");
+        assert!(!no_title.take_events().contains(&Event::TitleChanged));
+    }
+
+    #[test]
+    fn hyperlink_uri_lookup() {
+        let mut term = terminal();
+        term.vt_write(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ plain");
+        assert_eq!(
+            term.hyperlink_uri(0, 0).unwrap().as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(term.hyperlink_uri(5, 0).unwrap(), None);
     }
 }

@@ -222,6 +222,10 @@ impl RawCell {
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid native cell width {width}"))
     }
+    pub fn has_hyperlink(&self) -> Result<bool> {
+        // SAFETY: HAS_HYPERLINK writes a bool.
+        unsafe { query(|out| ffi::ghostty_cell_get(self.0, ffi::CellData::HAS_HYPERLINK, out)) }
+    }
 }
 impl CellIteration<'_> {
     pub fn raw_cell(&self) -> Result<RawCell> {

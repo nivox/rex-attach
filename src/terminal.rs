@@ -12,7 +12,7 @@ pub struct State {
     snapshot: SnapshotBuffer,
     parser: ApcParser,
     held_since: Option<std::time::Instant>,
-    clipboard: bool,
+    forward: Option<crate::vt::Forward>,
 }
 impl State {
     pub fn is_ready(&self) -> bool {
@@ -34,21 +34,21 @@ impl State {
             snapshot: SnapshotBuffer::default(),
             parser: ApcParser::new(nonce),
             held_since: None,
-            clipboard: false,
+            forward: None,
         }
     }
-    pub fn enable_clipboard(&mut self) -> Result<()> {
-        self.clipboard = true;
+    pub fn enable_forwarding(&mut self, forward: crate::vt::Forward) -> Result<()> {
+        self.forward = Some(forward);
         match &mut self.terminal {
-            Some(terminal) => terminal.enable_clipboard_writes(),
+            Some(terminal) => terminal.enable_events(forward),
             None => Ok(()),
         }
     }
-    pub fn take_clipboard(&mut self) -> Vec<crate::vt::ClipboardWrite> {
-        self.terminal
-            .as_mut()
-            .map(Terminal::take_clipboard_writes)
-            .unwrap_or_default()
+    pub fn take_outer_output(&mut self) -> Result<String> {
+        match &mut self.terminal {
+            Some(terminal) => outer_output(terminal),
+            None => Ok(String::new()),
+        }
     }
     pub fn render_held(&mut self, now: std::time::Instant) -> Result<bool> {
         let held = match &self.terminal {
@@ -71,8 +71,8 @@ impl State {
                 return Ok(());
             };
             let mut terminal = terminal;
-            if self.clipboard {
-                terminal.enable_clipboard_writes()?;
+            if let Some(forward) = self.forward {
+                terminal.enable_events(forward)?;
             }
             self.terminal = Some(terminal);
             tail = rest;
@@ -378,6 +378,48 @@ impl ApcParser {
         }
         Ok(result)
     }
+}
+
+fn sanitize_osc(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+pub(crate) fn outer_output(terminal: &mut Terminal) -> Result<String> {
+    use crate::vt::Event;
+    let mut out = String::new();
+    let mut pwd = false;
+    let mut title = false;
+    let mut bell = false;
+    for event in terminal.take_events() {
+        match event {
+            Event::Clipboard(c) => out.push_str(&c.osc52()),
+            Event::PwdChanged => pwd = true,
+            Event::TitleChanged => title = true,
+            Event::Bell => bell = true,
+        }
+    }
+    if pwd {
+        let value = sanitize_osc(&terminal.pwd()?, 4096);
+        if !value.is_empty() {
+            out.push_str("\x1b]7;");
+            out.push_str(&value);
+            out.push_str("\x1b\\");
+        }
+    }
+    if title {
+        let value = sanitize_osc(&terminal.title()?, 1024);
+        out.push_str("\x1b]2;");
+        out.push_str(&value);
+        out.push_str("\x1b\\");
+    }
+    if bell {
+        out.push('\x07');
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -837,7 +879,51 @@ mod tests {
         assert_eq!(parser.feed(bytes)?, vec![Part::Output(bytes.to_vec())]);
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod benchmark;
+    #[test]
+    fn outer_output_sanitizes_and_coalesces() {
+        let mut term = Terminal::new(crate::vt::TerminalOptions {
+            cols: 20,
+            rows: 4,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        term.enable_events(crate::vt::Forward {
+            clipboard: true,
+            title: true,
+        })
+        .unwrap();
+        term.vt_write(b"\x1b]2;first\x07\x07\x1b]2;sec\x01ond\x07\x07");
+        let out = super::outer_output(&mut term).unwrap();
+        assert_eq!(out, "\x1b]2;second\x1b\\\x07");
+        assert_eq!(super::outer_output(&mut term).unwrap(), "");
+    }
+
+    #[test]
+    fn ansi_renderer_forwards_hyperlinks() {
+        let mut source = Terminal::new(crate::vt::TerminalOptions {
+            cols: 20,
+            rows: 4,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        source.vt_write(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        let mut renderer = super::Renderer::new(super::Backend::Ansi).unwrap();
+        let frame = renderer.frame(&source, 20, 4).unwrap();
+        assert!(frame.contains("\x1b]8;;https://example.com\x1b\\"));
+        assert!(frame.contains("\x1b]8;;\x1b\\"));
+
+        let mut display = Terminal::new(crate::vt::TerminalOptions {
+            cols: 20,
+            rows: 4,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        display.vt_write(frame.as_bytes());
+        assert_eq!(
+            display.hyperlink_uri(0, 0).unwrap().as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(display.hyperlink_uri(4, 0).unwrap(), None);
+    }
+}

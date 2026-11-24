@@ -202,10 +202,16 @@ its service.
 
 ### Theme inheritance
 
-Clipboard writes from the attached program (OSC 52, as used by vim and tmux) are
-forwarded to the outer terminal while attached. Set `"clipboard": false` in
-`config.json` to disable this. Clipboard reads are not supported, and preview and
-capture never forward writes.
+While attached, clipboard writes (OSC 52, as used by vim and tmux), the block's
+window title (OSC 0/2), bell (BEL), working directory (OSC 7), and hyperlinks
+(OSC 8, default ANSI renderer only) are forwarded to the outer terminal. Because
+`rex-attach` enables mouse reporting while attached, outer terminals (such as
+Ghostty) require holding their mouse-reporting override modifier (e.g. `Shift` /
+`Ctrl+Shift`) to hover or open hyperlinks. Set
+`"clipboard": false` or `"title": false` in `config.json` to disable clipboard
+or title forwarding. The outer title is saved on start and restored when leaving
+an attachment or exiting (XTWINOPS 22/23, ignored by terminals without support).
+Clipboard reads are not supported, and preview and capture never forward events.
 
 Set `"inherit_theme": false` in `config.json` to keep the Rex block's theme on
 attach. The default is `true`. Use `--inherit-theme` or `--no-inherit-theme` to

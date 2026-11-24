@@ -31,7 +31,7 @@ pub fn decode(bytes: &[u8], image_limit: u64) -> Result<Terminal> {
         ))?;
     }
     let terminal = Terminal {
-        clipboard: None,
+        events: None,
         handle: Owned::create(
             |out| {
                 // SAFETY: complete decoding transfers ownership only after validation.

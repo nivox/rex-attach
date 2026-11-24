@@ -30,6 +30,7 @@ pub struct Bindings {
 pub struct Config {
     pub inherit_theme: bool,
     pub clipboard: bool,
+    pub title: bool,
     pub preview_layout: crate::browser::PreviewLayout,
     pub browser: Bindings,
     pub terminal: Bindings,
@@ -107,6 +108,11 @@ impl Config {
             clipboard: value
                 .get("clipboard")
                 .map(|value| value.as_bool().context("clipboard must be true or false"))
+                .transpose()?
+                .unwrap_or(true),
+            title: value
+                .get("title")
+                .map(|value| value.as_bool().context("title must be true or false"))
                 .transpose()?
                 .unwrap_or(true),
             preview_layout: value
@@ -551,5 +557,17 @@ mod tests {
         assert!(events.iter().all(|e| matches!(e, Event::Raw(_))));
         assert!(m.feed(b"\x1b").is_empty());
         assert!(matches!(&m.timeout()[0],Event::Action(a,_) if a=="client.browser.exit"));
+    }
+
+    #[test]
+    fn clipboard_and_title_config_defaults_and_validation() {
+        let default = Config::parse(json!({})).unwrap();
+        assert!(default.clipboard);
+        assert!(default.title);
+        let disabled = Config::parse(json!({"clipboard": false, "title": false})).unwrap();
+        assert!(!disabled.clipboard);
+        assert!(!disabled.title);
+        assert!(Config::parse(json!({"clipboard": "false"})).is_err());
+        assert!(Config::parse(json!({"title": "false"})).is_err());
     }
 }

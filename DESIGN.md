@@ -159,10 +159,18 @@ workloads, limitations and reproduction commands. Renderer changes must preserve
 dirty-row processing, cell widths, invalidation and output bounds; compare against
 the second-emulator tests and serial release benchmarks.
 
-Ghostty's clipboard-write callback is installed only for interactive attachment
-(`clipboard` config, default on). Decoded `text/plain` writes up to 1 MiB are
-re-encoded as OSC 52 and emitted before the next frame; clears, non-text writes and
-clipboard reads are refused. Preview and capture never install it.
+Outer terminal integration is installed only for interactive attachment.
+Ghostty callbacks queue bell, working-directory (`OSC 7`), optional title
+(`OSC 0/2`, `title` config, default on) and optional clipboard (`OSC 52`,
+`clipboard` config, default on) events. Before each frame, the queue is drained,
+sanitized (control characters stripped, length-bounded), coalesced (at most one
+bell, pwd, and title per batch), and emitted ahead of the frame; decoded
+`text/plain` clipboard writes up to 1 MiB are re-encoded as `OSC 52`, while
+clears, non-text writes, and clipboard reads are refused. The outer title is
+pushed on `tty::Guard` entry and popped when leaving attachment or exiting.
+Hyperlinks (`OSC 8`) are resolved in the default ANSI renderer only for cells
+flagged `HAS_HYPERLINK` and closed at row end so dirty-row string caching stays
+self-contained. Preview and capture never install these callbacks.
 
 One outer `tty::Guard` owns termios, raw mode, the alternate screen and autowrap
 across browser and attachment. Drop ends synchronized output, resets styles,

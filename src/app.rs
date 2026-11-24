@@ -229,9 +229,10 @@ async fn attach_inner(
         );
         return Ok(Flow::Exit);
     }
-    if args.shortcuts.clipboard {
-        state.enable_clipboard()?;
-    }
+    state.enable_forwarding(crate::vt::Forward {
+        clipboard: args.shortcuts.clipboard,
+        title: args.shortcuts.title,
+    })?;
     control
         .call(
             "session.own_block",
@@ -246,7 +247,7 @@ async fn attach_inner(
             )
             .await?;
     }
-    interactive(
+    let flow = interactive(
         target,
         control,
         &mut data,
@@ -254,7 +255,11 @@ async fn attach_inner(
         input.context("missing interactive input")?,
         args,
     )
-    .await
+    .await;
+    if args.shortcuts.title {
+        let _ = tty::restore_title();
+    }
+    flow
 }
 
 async fn interactive(
@@ -360,7 +365,7 @@ fn draw_terminal(
     size: (u16, u16),
 ) -> Result<bool> {
     let frame = renderer.frame(state.terminal()?, size.0, size.1)?;
-    let mut output: String = state.take_clipboard().iter().map(|c| c.osc52()).collect();
+    let mut output = state.take_outer_output()?;
     output.push_str(&frame);
     if !output.is_empty() {
         let mut out = io::stdout().lock();
