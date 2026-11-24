@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "rex-attach"
-version = "0.1.7-dev"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
