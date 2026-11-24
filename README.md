@@ -202,6 +202,11 @@ its service.
 
 ### Theme inheritance
 
+Clipboard writes from the attached program (OSC 52, as used by vim and tmux) are
+forwarded to the outer terminal while attached. Set `"clipboard": false` in
+`config.json` to disable this. Clipboard reads are not supported, and preview and
+capture never forward writes.
+
 Set `"inherit_theme": false` in `config.json` to keep the Rex block's theme on
 attach. The default is `true`. Use `--inherit-theme` or `--no-inherit-theme` to
 override the setting for one invocation.

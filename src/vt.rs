@@ -72,7 +72,37 @@ unsafe fn query<T>(read: impl FnOnce(*mut c_void) -> ffi::Result::Type) -> Resul
     Ok(unsafe { value.assume_init() })
 }
 
-pub struct Terminal(Owned<ffi::TerminalImpl>);
+pub struct Terminal {
+    // The native handle must drop before the queue its userdata points at.
+    handle: Owned<ffi::TerminalImpl>,
+    clipboard: Option<Box<std::cell::RefCell<Vec<ClipboardWrite>>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardLocation {
+    Standard,
+    Selection,
+    Primary,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardWrite {
+    pub location: ClipboardLocation,
+    pub text: Vec<u8>,
+}
+impl ClipboardWrite {
+    /// The OSC 52 sequence that makes the outer terminal perform this write.
+    pub fn osc52(&self) -> String {
+        use base64::Engine;
+        let target = match self.location {
+            ClipboardLocation::Standard => 'c',
+            ClipboardLocation::Selection => 's',
+            ClipboardLocation::Primary => 'p',
+        };
+        let data = base64::engine::general_purpose::STANDARD.encode(&self.text);
+        format!("\x1b]52;{target};{data}\x1b\\")
+    }
+}
+const CLIPBOARD_LIMIT: usize = 1024 * 1024;
 macro_rules! terminal_values {
     ($($name:ident:$ty:ty=>$tag:ident),*$(,)?)=>{$(
         pub fn $name(&self)->Result<$ty> {
@@ -84,15 +114,18 @@ macro_rules! terminal_values {
 impl Terminal {
     #[cfg(test)]
     pub fn new(options: TerminalOptions) -> Result<Self> {
-        let result = Self(Owned::create(
-            |out| {
-                // SAFETY: out is an initialized handle slot; dimensions are scalar values.
-                unsafe {
-                    ffi::ghostty_terminal_new(std::ptr::null(), out, options.cols, options.rows)
-                }
-            },
-            ffi::ghostty_terminal_free,
-        )?);
+        let result = Self {
+            handle: Owned::create(
+                |out| {
+                    // SAFETY: out is an initialized handle slot; dimensions are scalar values.
+                    unsafe {
+                        ffi::ghostty_terminal_new(std::ptr::null(), out, options.cols, options.rows)
+                    }
+                },
+                ffi::ghostty_terminal_free,
+            )?,
+            clipboard: None,
+        };
         result.set(
             ffi::TerminalOption::SCROLLBACK_MAX_BYTES,
             &options.max_scrollback,
@@ -103,10 +136,45 @@ impl Terminal {
         };
         result.set(ffi::TerminalOption::MODE_DEFAULT, &mode)?;
         // No input/query callbacks are installed: Rex alone answers the program.
+        // Clipboard writes are opt-in through enable_clipboard_writes.
         Ok(result)
     }
     pub(crate) fn raw(&self) -> ffi::Terminal {
-        self.0.raw()
+        self.handle.raw()
+    }
+    /// Queue decoded clipboard writes (OSC 52, OSC 1337, OSC 5522) for the caller.
+    pub fn enable_clipboard_writes(&mut self) -> Result<()> {
+        if self.clipboard.is_some() {
+            return Ok(());
+        }
+        let queue: Box<std::cell::RefCell<Vec<ClipboardWrite>>> = Box::default();
+        let userdata = std::ptr::from_ref(&*queue).cast::<c_void>();
+        // SAFETY: the boxed queue has a stable address and outlives the native
+        // handle (field order); both options take the documented pointer types.
+        unsafe {
+            check(ffi::ghostty_terminal_set(
+                self.raw(),
+                ffi::TerminalOption::USERDATA,
+                userdata,
+            ))?;
+            let callback: ffi::TerminalClipboardWriteFn = Some(clipboard_write);
+            check(ffi::ghostty_terminal_set(
+                self.raw(),
+                ffi::TerminalOption::CLIPBOARD_WRITE,
+                callback.map_or(std::ptr::null(), |f| f as *const c_void),
+            ))?;
+        }
+        self.clipboard = Some(queue);
+        self.set(
+            ffi::TerminalOption::CLIPBOARD_WRITE_MAX_BYTES,
+            &CLIPBOARD_LIMIT,
+        )
+    }
+    pub fn take_clipboard_writes(&mut self) -> Vec<ClipboardWrite> {
+        self.clipboard
+            .as_ref()
+            .map(|queue| std::mem::take(&mut *queue.borrow_mut()))
+            .unwrap_or_default()
     }
     fn set<T>(&self, tag: ffi::TerminalOption::Type, value: &T) -> Result<()> {
         // SAFETY: private callers provide the C type documented for each tag.
@@ -239,5 +307,104 @@ impl Terminal {
     pub fn set_continuation_max_bytes(&mut self, limit: usize) -> Result<&mut Self> {
         self.set(ffi::TerminalOption::CONTINUATION_MAX_BYTES, &limit)?;
         Ok(self)
+    }
+}
+
+unsafe extern "C" fn clipboard_write(
+    _terminal: ffi::Terminal,
+    userdata: *mut c_void,
+    write: *const ffi::ClipboardWrite,
+) {
+    if write.is_null() || userdata.is_null() {
+        return;
+    }
+    // SAFETY: the native call provides a valid request for this callback only.
+    let raw = unsafe { &*write };
+    if raw.size
+        < std::mem::offset_of!(ffi::ClipboardWrite, reply) + size_of::<ffi::ClipboardWriteReplyFn>()
+    {
+        return;
+    }
+    let bytes = |s: ffi::String| -> &'static [u8] {
+        if s.ptr.is_null() || s.len == 0 {
+            &[]
+        } else {
+            // SAFETY: strings are borrowed and valid for the callback duration,
+            // and never escape it (data is copied below).
+            unsafe { std::slice::from_raw_parts(s.ptr, s.len) }
+        }
+    };
+    let location = match raw.location {
+        ffi::ClipboardLocation::STANDARD => Some(ClipboardLocation::Standard),
+        ffi::ClipboardLocation::SELECTION => Some(ClipboardLocation::Selection),
+        ffi::ClipboardLocation::PRIMARY => Some(ClipboardLocation::Primary),
+        _ => None,
+    };
+    let contents: &[ffi::ClipboardContent] = if raw.contents.is_null() {
+        &[]
+    } else {
+        // SAFETY: the contents array has contents_len valid entries.
+        unsafe { std::slice::from_raw_parts(raw.contents, raw.contents_len) }
+    };
+    let text = contents
+        .iter()
+        .find(|c| bytes(c.mime).starts_with(b"text/plain"))
+        .map(|c| bytes(c.data))
+        .filter(|data| data.len() <= CLIPBOARD_LIMIT);
+    let mut result = ffi::ClipboardWriteResult::UNSUPPORTED;
+    if let (Some(location), Some(text)) = (location, text) {
+        // SAFETY: userdata is the boxed queue installed by enable_clipboard_writes.
+        let queue = unsafe { &*userdata.cast::<std::cell::RefCell<Vec<ClipboardWrite>>>() };
+        result = match queue.try_borrow_mut() {
+            Ok(mut queue) => {
+                queue.push(ClipboardWrite {
+                    location,
+                    text: text.to_vec(),
+                });
+                ffi::ClipboardWriteResult::SUCCESS
+            }
+            Err(_) => ffi::ClipboardWriteResult::BUSY,
+        };
+    }
+    let reply = ffi::ClipboardWriteReply {
+        size: size_of::<ffi::ClipboardWriteReply>(),
+        result,
+        remember: false,
+    };
+    if let Some(reply_fn) = raw.reply {
+        // SAFETY: replying inside the callback with the request is the contract.
+        unsafe { reply_fn(write, &raw const reply) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal() -> Terminal {
+        Terminal::new(TerminalOptions {
+            cols: 20,
+            rows: 4,
+            max_scrollback: 0,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn osc52_is_queued_only_when_enabled() {
+        let mut off = terminal();
+        off.vt_write(b"\x1b]52;c;aGVsbG8=\x1b\\");
+        assert!(off.take_clipboard_writes().is_empty());
+
+        let mut on = terminal();
+        on.enable_clipboard_writes().unwrap();
+        on.vt_write(b"\x1b]52;c;aGVsbG8=\x1b\\\x1b]52;p;aGk=\x07");
+        let writes = on.take_clipboard_writes();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].location, ClipboardLocation::Standard);
+        assert_eq!(writes[0].text, b"hello");
+        assert_eq!(writes[0].osc52(), "\x1b]52;c;aGVsbG8=\x1b\\");
+        assert_eq!(writes[1].location, ClipboardLocation::Primary);
+        assert!(on.take_clipboard_writes().is_empty());
     }
 }

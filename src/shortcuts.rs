@@ -29,6 +29,7 @@ pub struct Bindings {
 }
 pub struct Config {
     pub inherit_theme: bool,
+    pub clipboard: bool,
     pub preview_layout: crate::browser::PreviewLayout,
     pub browser: Bindings,
     pub terminal: Bindings,
@@ -101,6 +102,11 @@ impl Config {
                         .as_bool()
                         .context("inherit_theme must be true or false")
                 })
+                .transpose()?
+                .unwrap_or(true),
+            clipboard: value
+                .get("clipboard")
+                .map(|value| value.as_bool().context("clipboard must be true or false"))
                 .transpose()?
                 .unwrap_or(true),
             preview_layout: value

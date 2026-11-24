@@ -30,13 +30,16 @@ pub fn decode(bytes: &[u8], image_limit: u64) -> Result<Terminal> {
             std::ptr::from_ref(&continuation_limit).cast(),
         ))?;
     }
-    let terminal = Terminal(Owned::create(
-        |out| {
-            // SAFETY: complete decoding transfers ownership only after validation.
-            unsafe { ffi::ghostty_snapshot_decoder_decode(decoder.raw(), out) }
-        },
-        ffi::ghostty_terminal_free,
-    )?);
+    let terminal = Terminal {
+        clipboard: None,
+        handle: Owned::create(
+            |out| {
+                // SAFETY: complete decoding transfers ownership only after validation.
+                unsafe { ffi::ghostty_snapshot_decoder_decode(decoder.raw(), out) }
+            },
+            ffi::ghostty_terminal_free,
+        )?,
+    };
     // SAFETY: SOURCE_OFFSET writes a size_t after successful decoding.
     let consumed: usize = unsafe {
         query(|out| {

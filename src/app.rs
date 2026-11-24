@@ -229,6 +229,9 @@ async fn attach_inner(
         );
         return Ok(Flow::Exit);
     }
+    if args.shortcuts.clipboard {
+        state.enable_clipboard()?;
+    }
     control
         .call(
             "session.own_block",
@@ -357,9 +360,11 @@ fn draw_terminal(
     size: (u16, u16),
 ) -> Result<bool> {
     let frame = renderer.frame(state.terminal()?, size.0, size.1)?;
-    if !frame.is_empty() {
+    let mut output: String = state.take_clipboard().iter().map(|c| c.osc52()).collect();
+    output.push_str(&frame);
+    if !output.is_empty() {
         let mut out = io::stdout().lock();
-        out.write_all(frame.as_bytes())
+        out.write_all(output.as_bytes())
             .context("drawing terminal screen")?;
         out.flush().context("flushing terminal screen")?;
     }

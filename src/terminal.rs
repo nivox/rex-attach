@@ -12,6 +12,7 @@ pub struct State {
     snapshot: SnapshotBuffer,
     parser: ApcParser,
     held_since: Option<std::time::Instant>,
+    clipboard: bool,
 }
 impl State {
     pub fn is_ready(&self) -> bool {
@@ -33,7 +34,21 @@ impl State {
             snapshot: SnapshotBuffer::default(),
             parser: ApcParser::new(nonce),
             held_since: None,
+            clipboard: false,
         }
+    }
+    pub fn enable_clipboard(&mut self) -> Result<()> {
+        self.clipboard = true;
+        match &mut self.terminal {
+            Some(terminal) => terminal.enable_clipboard_writes(),
+            None => Ok(()),
+        }
+    }
+    pub fn take_clipboard(&mut self) -> Vec<crate::vt::ClipboardWrite> {
+        self.terminal
+            .as_mut()
+            .map(Terminal::take_clipboard_writes)
+            .unwrap_or_default()
     }
     pub fn render_held(&mut self, now: std::time::Instant) -> Result<bool> {
         let held = match &self.terminal {
@@ -55,6 +70,10 @@ impl State {
             let Some((terminal, rest)) = self.snapshot.push(bytes)? else {
                 return Ok(());
             };
+            let mut terminal = terminal;
+            if self.clipboard {
+                terminal.enable_clipboard_writes()?;
+            }
             self.terminal = Some(terminal);
             tail = rest;
             &tail

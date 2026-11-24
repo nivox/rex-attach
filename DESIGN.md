@@ -159,6 +159,11 @@ workloads, limitations and reproduction commands. Renderer changes must preserve
 dirty-row processing, cell widths, invalidation and output bounds; compare against
 the second-emulator tests and serial release benchmarks.
 
+Ghostty's clipboard-write callback is installed only for interactive attachment
+(`clipboard` config, default on). Decoded `text/plain` writes up to 1 MiB are
+re-encoded as OSC 52 and emitted before the next frame; clears, non-text writes and
+clipboard reads are refused. Preview and capture never install it.
+
 One outer `tty::Guard` owns termios, raw mode, the alternate screen and autowrap
 across browser and attachment. Drop ends synchronized output, resets styles,
 restores wrap/cursor/screen and saved termios. Input opens `/dev/tty` independently
