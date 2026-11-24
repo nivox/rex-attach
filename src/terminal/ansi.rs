@@ -8,7 +8,7 @@ pub struct Renderer {
     lines: Vec<String>,
     dimensions: Option<(u16, u16, u16, u16)>,
     background: Option<crate::vt::style::RgbColor>,
-    cursor: Option<Option<(u16, u16)>>,
+    cursor: Option<Option<Cursor>>,
 }
 
 impl Renderer {
@@ -48,14 +48,7 @@ impl Renderer {
         let reset =
             self.dimensions != Some(dimensions) || self.background != Some(defaults.background);
         let all = reset || snapshot.dirty()? == Dirty::Full;
-        let cursor = if snapshot.cursor_visible()? {
-            snapshot
-                .cursor_viewport()?
-                .filter(|p| p.x < width && p.y < height)
-                .map(|p| (p.x, p.y))
-        } else {
-            None
-        };
+        let cursor = Cursor::from_snapshot(&snapshot, width, height)?;
         let mut body = String::new();
         if reset {
             self.lines.clear();
@@ -95,7 +88,7 @@ impl Renderer {
         if body.is_empty() && self.cursor == Some(cursor) {
             return Ok((String::new(), images));
         }
-        let out = finish_frame(&body, cursor)?;
+        let out = finish_frame(&body, cursor, self.cursor.flatten())?;
         self.cursor = Some(cursor);
         Ok((out, images))
     }
@@ -133,7 +126,7 @@ impl RowPainter {
         Ok(())
     }
 }
-fn finish_frame(body: &str, cursor: Option<(u16, u16)>) -> Result<String> {
+fn finish_frame(body: &str, cursor: Option<Cursor>, previous: Option<Cursor>) -> Result<String> {
     use std::fmt::Write;
     let mut out = String::with_capacity(body.len() + 64);
     // Synchronized output is ignored by terminals that do not support it.
@@ -141,7 +134,11 @@ fn finish_frame(body: &str, cursor: Option<(u16, u16)>) -> Result<String> {
     out.push_str("\x1b[?2026h\x1b[?25l");
     out.push_str(body);
     out.push_str("\x1b[0m");
-    if let Some((x, y)) = cursor {
+    if let Some(cursor) = cursor {
+        if let Some(style) = cursor.changed_style(previous) {
+            write!(out, "{style}")?;
+        }
+        let (x, y) = cursor.position;
         write!(out, "\x1b[{};{}H\x1b[?25h", y + 1, x + 1)?;
     }
     out.push_str("\x1b[?2026l");

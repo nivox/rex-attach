@@ -45,19 +45,20 @@ impl Grid {
         let rows = snapshot.rows()?.min(120);
         ensure!(cols > 0 && rows > 0, "empty terminal grid");
         let colors = snapshot.colors()?;
+        let cursor = snapshot.cursor()?;
         let mut grid = Self {
             cols,
             rows,
             cells: Vec::with_capacity(usize::from(cols) * usize::from(rows)),
-            cursor: None,
+            cursor: cursor
+                .viewport
+                .filter(|_| cursor.visible)
+                .map(|p| (p.x, p.y)),
             cursor_color: rgb(snapshot.cursor_color()?.unwrap_or(colors.foreground)),
             background: rgb(colors.background),
             images: images.capture(terminal, &snapshot)?,
             cell_pixels: crate::graphics::cell_pixels(terminal)?,
         };
-        if snapshot.cursor_visible()? {
-            grid.cursor = snapshot.cursor_viewport()?.map(|p| (p.x, p.y));
-        }
         let mut row_iterator = RowIterator::new()?;
         let mut cell_iterator = CellIterator::new()?;
         let mut lines = row_iterator.update(&snapshot)?;

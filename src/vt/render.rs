@@ -1,7 +1,8 @@
 //! Borrowed access to one render update. Rows and cells cannot survive their
 //! cursor, and snapshots prevent both native-state updates and VT writes.
 use super::*;
-pub use ghostty_vt::render::{Colors, CursorViewport, Dirty};
+use ghostty_vt::render::CursorViewport;
+pub use ghostty_vt::render::{Colors, Cursor, CursorVisualStyle, Dirty};
 
 pub struct RenderState(Owned<ffi::RenderStateImpl>);
 pub struct Snapshot<'a> {
@@ -47,9 +48,6 @@ impl Snapshot<'_> {
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid native dirty state {value}"))
     }
-    pub fn cursor_visible(&self) -> Result<bool> {
-        self.scalar(ffi::RenderStateData::CURSOR_VISIBLE)
-    }
     pub fn cursor_color(&self) -> Result<Option<style::RgbColor>> {
         if self.scalar::<bool>(ffi::RenderStateData::COLOR_CURSOR_HAS_VALUE)? {
             Ok(Some(
@@ -60,15 +58,32 @@ impl Snapshot<'_> {
             Ok(None)
         }
     }
-    pub fn cursor_viewport(&self) -> Result<Option<CursorViewport>> {
-        if !self.scalar::<bool>(ffi::RenderStateData::CURSOR_VIEWPORT_HAS_VALUE)? {
-            return Ok(None);
-        }
-        Ok(Some(CursorViewport {
-            x: self.scalar(ffi::RenderStateData::CURSOR_VIEWPORT_X)?,
-            y: self.scalar(ffi::RenderStateData::CURSOR_VIEWPORT_Y)?,
-            at_wide_tail: self.scalar(ffi::RenderStateData::CURSOR_VIEWPORT_WIDE_TAIL)?,
-        }))
+    pub fn cursor(&self) -> Result<Cursor> {
+        let mut cursor = ffi::RenderStateCursor {
+            size: std::mem::size_of::<ffi::RenderStateCursor>(),
+            ..Default::default()
+        };
+        // SAFETY: the sized CURSOR query initializes this exact C structure.
+        check(unsafe {
+            ffi::ghostty_render_state_get(
+                self.raw(),
+                ffi::RenderStateData::CURSOR,
+                std::ptr::from_mut(&mut cursor).cast(),
+            )
+        })?;
+        Ok(Cursor {
+            viewport: cursor.viewport_has_value.then_some(CursorViewport {
+                x: cursor.viewport_x,
+                y: cursor.viewport_y,
+                at_wide_tail: cursor.wide_tail,
+            }),
+            visible: cursor.visible,
+            blinking: cursor.blinking,
+            password_input: cursor.password_input,
+            visual_style: cursor.visual_style.try_into().map_err(|_| {
+                anyhow::anyhow!("invalid native cursor style {}", cursor.visual_style)
+            })?,
+        })
     }
     pub fn colors(&self) -> Result<Colors> {
         let mut colors = ffi::RenderStateColors {

@@ -1,9 +1,10 @@
 use crate::stream::SnapshotBuffer;
 use crate::vt::{
     RenderState, Terminal,
-    render::{CellIterator, RowIterator},
+    render::{CellIterator, CursorVisualStyle, RowIterator, Snapshot},
 };
 use anyhow::{Result, ensure};
+use ratatui::crossterm::cursor::SetCursorStyle;
 use serde_json::Value;
 
 pub struct State {
@@ -193,6 +194,37 @@ fn text_row(
 
 mod ansi;
 mod ratatui_backend;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    position: (u16, u16),
+    style: SetCursorStyle,
+}
+
+impl Cursor {
+    fn from_snapshot(snapshot: &Snapshot<'_>, width: u16, height: u16) -> Result<Option<Self>> {
+        let cursor = snapshot.cursor()?;
+        Ok(cursor
+            .viewport
+            .filter(|p| cursor.visible && p.x < width && p.y < height)
+            .map(|p| Self {
+                position: (p.x, p.y),
+                style: match (cursor.visual_style, cursor.blinking) {
+                    (CursorVisualStyle::Bar, true) => SetCursorStyle::BlinkingBar,
+                    (CursorVisualStyle::Bar, false) => SetCursorStyle::SteadyBar,
+                    (CursorVisualStyle::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+                    (CursorVisualStyle::Underline, false) => SetCursorStyle::SteadyUnderScore,
+                    // DECSCUSR has no hollow block style.
+                    (_, true) => SetCursorStyle::BlinkingBlock,
+                    (_, false) => SetCursorStyle::SteadyBlock,
+                },
+            }))
+    }
+
+    fn changed_style(self, previous: Option<Self>) -> Option<SetCursorStyle> {
+        (previous.map(|cursor| cursor.style) != Some(self.style)).then_some(self.style)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum Backend {
@@ -471,6 +503,64 @@ mod tests {
         assert!(cursor.len() < 64);
         assert!(!cursor.contains("38;2"));
         assert!(renderer.frame(&source, 80, 24)?.contains("\x1b[2J"));
+        Ok(())
+    }
+
+    #[test]
+    fn both_renderers_mirror_cursor_style_without_repainting_cells() -> Result<()> {
+        let options = TerminalOptions {
+            cols: 20,
+            rows: 4,
+            ..Default::default()
+        };
+        let mut source = Terminal::new(options)?;
+        source.vt_write(b"cursor\x1b[6 q");
+        let initial = snapshot::encode(&source)?;
+        for backend in [Backend::Ansi, Backend::Ratatui] {
+            let mut state = State::new(1);
+            state.feed(&initial)?;
+            let mut renderer = super::Renderer::new(backend)?;
+            let mut display = Terminal::new(options)?;
+            display.vt_write(b"\x1b[?7l");
+            let first = renderer.frame(state.terminal()?, 20, 4)?;
+            assert!(first.contains("\x1b[6 q"), "{backend:?}");
+            display.vt_write(first.as_bytes());
+
+            let mut render_state = RenderState::new()?;
+            for (code, shape, blinking) in [
+                (5, CursorVisualStyle::Bar, true),
+                (3, CursorVisualStyle::Underline, true),
+                (4, CursorVisualStyle::Underline, false),
+                (2, CursorVisualStyle::Block, false),
+                (1, CursorVisualStyle::Block, true),
+                (6, CursorVisualStyle::Bar, false),
+            ] {
+                let sequence = format!("\x1b[{code} q");
+                state.feed(sequence.as_bytes())?;
+                let delta = renderer.frame(state.terminal()?, 20, 4)?;
+                assert!(delta.contains(&sequence) && delta.len() < 64, "{delta:?}");
+                assert!(!delta.contains("38;2"));
+                display.vt_write(delta.as_bytes());
+                let cursor = render_state.update(&display)?.cursor()?;
+                assert_eq!(cursor.visual_style, shape, "{backend:?}");
+                assert_eq!(cursor.blinking, blinking, "{backend:?}");
+                assert!(cursor.visible);
+                assert_eq!(cursor.viewport.map(|p| (p.x, p.y)), Some((6, 0)));
+                assert!(renderer.frame(state.terminal()?, 20, 4)?.is_empty());
+            }
+
+            state.feed(b"\x1b[2;2H")?;
+            let moved = renderer.frame(state.terminal()?, 20, 4)?;
+            assert!(moved.contains("\x1b[2;2H") && !moved.contains(" q"));
+            state.feed(b"\x1b[?25l")?;
+            let hidden = renderer.frame(state.terminal()?, 20, 4)?;
+            assert!(hidden.contains("\x1b[?25l") && !hidden.contains("\x1b[?25h"));
+            state.feed(b"\x1b[4 q")?;
+            assert!(renderer.frame(state.terminal()?, 20, 4)?.is_empty());
+            state.feed(b"\x1b[?25h")?;
+            let shown = renderer.frame(state.terminal()?, 20, 4)?;
+            assert!(shown.contains("\x1b[4 q") && shown.contains("\x1b[?25h"));
+        }
         Ok(())
     }
 

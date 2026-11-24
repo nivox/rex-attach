@@ -15,7 +15,7 @@ pub struct Renderer {
     buffers: Buffers,
     dimensions: Option<(u16, u16, u16, u16)>,
     colors: Option<(crate::vt::style::RgbColor, crate::vt::style::RgbColor)>,
-    cursor: Option<Option<(u16, u16)>>,
+    cursor: Option<Option<Cursor>>,
     text: String,
 }
 
@@ -70,14 +70,7 @@ impl Renderer {
                 .map(|y| Buffer::filled(Rect::new(0, y, width, 1), blank.clone()))
                 .collect();
         }
-        let cursor = if snapshot.cursor_visible()? {
-            snapshot
-                .cursor_viewport()?
-                .filter(|p| p.x < width && p.y < height)
-                .map(|p| (p.x, p.y))
-        } else {
-            None
-        };
+        let cursor = Cursor::from_snapshot(&snapshot, width, height)?;
         self.buffers.dirty_rows.clear();
         if reset {
             // Also paint padding outside the source screen when dimensions/theme change.
@@ -109,9 +102,7 @@ impl Renderer {
                 paint_cell(cell, target, &mut self.text, &defaults, width - at_x)?;
             }
         }
-        let output = self
-            .buffers
-            .draw_changes(reset, cursor, self.cursor != Some(cursor))?;
+        let output = self.buffers.draw_changes(reset, cursor, self.cursor)?;
         // Keep the two buffers equal without copying clean rows on sparse updates.
         for &y in &self.buffers.dirty_rows {
             self.buffers.previous[y].clone_from(&self.buffers.current[y]);
@@ -184,8 +175,8 @@ impl Buffers {
     fn draw_changes(
         &self,
         reset: bool,
-        cursor: Option<(u16, u16)>,
-        cursor_changed: bool,
+        cursor: Option<Cursor>,
+        previous: Option<Option<Cursor>>,
     ) -> Result<Vec<u8>> {
         use std::io::Write;
         // Ratatui performs cell diffing within Ghostty's dirty rows, avoiding a
@@ -197,7 +188,7 @@ impl Buffers {
             .peekable();
         let changed = changes.peek().is_some();
         let mut output = Vec::new();
-        if changed || reset || cursor_changed {
+        if changed || reset || previous != Some(cursor) {
             let mut backend = CrosstermBackend::new(&mut output);
             backend.write_all(b"\x1b[?2026h")?;
             backend.hide_cursor()?;
@@ -207,8 +198,11 @@ impl Buffers {
             if changed {
                 backend.draw(changes)?;
             }
-            if let Some(position) = cursor {
-                backend.set_cursor_position(position)?;
+            if let Some(cursor) = cursor {
+                if let Some(style) = cursor.changed_style(previous.flatten()) {
+                    write!(backend, "{style}")?;
+                }
+                backend.set_cursor_position(cursor.position)?;
                 backend.show_cursor()?;
             }
             backend.write_all(b"\x1b[?2026l")?;
